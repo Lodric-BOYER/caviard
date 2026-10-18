@@ -90,6 +90,15 @@ def test_email(redactor: Redactor) -> None:
 
 
 @pytest.mark.parametrize(
+    "address", ["inès.robert@exemple.fr", "josé@exemple.es", "contact@café-crème.fr", "李@例え.jp"]
+)
+def test_email_with_unicode_letters(redactor: Redactor, address: str) -> None:
+    text = f"contact : {address}, merci"
+    assert spans(redactor, text) == [address]  # whole address, no letter left in clear
+    assert redactor.redact_text(text).startswith("contact : [EMAIL:")
+
+
+@pytest.mark.parametrize(
     ("text", "secret"),
     [
         ("clé sk-proj-" + "A1b2" * 10, "sk-proj-" + "A1b2" * 10),

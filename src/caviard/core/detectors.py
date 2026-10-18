@@ -141,9 +141,11 @@ _JWT = re.compile(
     r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{5,8000}\.eyJ[A-Za-z0-9_\-]{5,16000}"
     r"\.[A-Za-z0-9_\-]{0,8000}(?![A-Za-z0-9_\-])"
 )
+# Unicode letters are allowed (RFC 6531 addresses, IDN domains): an ASCII-only local
+# part would leave "inè" of "inès.robert@exemple.fr" in clear.
 _EMAIL = re.compile(
-    r"(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]{1,64}@"
-    r"(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.){1,8}[A-Za-z]{2,24}(?![A-Za-z0-9\-])"
+    r"(?<![\w.%+\-])[\w.%+\-]{1,64}@"
+    r"(?:[^\W_](?:[\w\-]{0,61}[^\W_])?\.){1,8}[^\W\d_]{2,24}(?![\w\-])"
 )
 _NIR = _numeric(
     r"(?<![0-9A-Za-z])[1-478]~[0-9]{2}~[0-9]{2}~(?:[0-9]{2}|2[ABab])~[0-9]{3}~[0-9]{3}~[0-9]{2}"
