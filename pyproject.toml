@@ -118,6 +118,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 timeout = 120
 markers = [
@@ -128,7 +129,9 @@ markers = [
 [tool.coverage.run]
 source = ["caviard"]
 branch = true
+omit = ["*/caviard/__main__.py"]  # exercised in a subprocess
 
 [tool.coverage.report]
+fail_under = 90
 show_missing = true
 skip_covered = true

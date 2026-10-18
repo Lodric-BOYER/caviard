@@ -1,26 +1,26 @@
-# Caviard : règles du projet pour Claude Code
+# Caviard: project rules for Claude Code
 
-Caviard masque les données personnelles et les secrets dans les traces et les logs
-d'agents IA, au moment de l'export. La conception complète (privée, non versionnée)
-est dans `notes/conception.md` quand le fichier est présent.
+Caviard redacts personal data and secrets from AI agent traces and logs at export
+time. The full design notes (private, not versioned) live in `notes/conception.md`
+when the file is present.
 
-## Invariants (non négociables, chacun couvert par un test)
-- I1 fail-closed : aucune valeur non traitée n'est exportée ; en cas d'erreur, quarantaine puis abandon.
-- I2 idempotence : masquer deux fois donne le même résultat que masquer une fois.
-- I3 silence : aucune valeur brute dans les messages d'erreur, les logs ou les rapports.
-- I4 temps borné : regex à quantificateurs bornés, pré-filtre obligatoire, plafond de taille, test sur 1 Mo.
-- I5 corrélation : même clé HMAC, même pseudonyme ; la clé n'apparaît jamais dans les sorties.
-- I6 lisibilité : noms d'outils, modèles et compteurs de tokens restent en clair.
+## Invariants (non-negotiable, each one covered by a test)
+- I1 fail-closed: no unprocessed value is ever exported; on error, quarantine, then drop.
+- I2 idempotence: redacting twice gives the same result as redacting once.
+- I3 silence: no analysed value in error messages, logs or reports.
+- I4 bounded time: bounded regex quantifiers, mandatory pre-filters, size cap, 1 MB tests.
+- I5 correlation: same HMAC key, same pseudonym; the key never appears in any output.
+- I6 readability: tool names, model names and token counts stay in clear.
 
-## Règles de code
-- Noyau (`src/caviard/core`) : bibliothèque standard uniquement, aucune dépendance.
-- Paquets tiers importés seulement dans `caviard.otel` et `caviard.integrations.*`.
-- Aucune donnée réelle dans le dépôt : Faker `fr_FR` et gabarits synthétiques seulement.
-- Tout changement arrive avec son test ; pytest, ruff et mypy doivent passer.
-- Commentaires concis, par blocs, pas ligne à ligne.
-- Une étape à la fois : la suivante ne commence pas tant que les tests ne sont pas verts.
+## Code rules
+- Core (`src/caviard/core`): standard library only, no dependency.
+- Third-party packages are imported only in `caviard.otel` and `caviard.integrations.*`.
+- No real personal data in the repository: Faker `fr_FR` and synthetic templates only.
+- Every change comes with its test; pytest, ruff and mypy must pass.
+- Comments and docstrings in English, concise, one block per idea (no line-by-line comments).
+- One step at a time: the next one starts only when the test suite is green.
 
-## Commandes
-- Installer : `uv venv && uv pip install -e . --group dev` (ou `pip install -e . --group dev`, pip 25.1 ou plus)
-- Tester : `pytest`
-- Vérifier : `ruff check . && ruff format --check . && mypy`
+## Commands
+- Install: `uv venv && uv pip install -e . --group dev` (or `pip install -e . --group dev`, pip 25.1+)
+- Test: `pytest`
+- Check: `ruff check . && ruff format --check . && mypy`
