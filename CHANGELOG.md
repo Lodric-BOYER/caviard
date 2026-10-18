@@ -21,8 +21,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - Detector plugins through the `caviard.detectors` entry point group.
 - `caviard scan` and `caviard keygen` commands.
 - `caviard.otel.RedactingSpanExporter`: wraps any OpenTelemetry span exporter and
-  exports redacted copies of span names, attributes, events, links and status
-  messages. A span that cannot be redacted is quarantined or dropped (`on_error`).
+  exports redacted copies of span names, attributes, events, links, status
+  messages and resource attributes. A span that cannot be redacted is quarantined
+  or dropped (`on_error`).
 - `caviard.integrations.langfuse.mask_otel_spans`: hook for the Langfuse SDK v5. Each
   span is handled on its own, so one failure never drops the whole export batch.
 - `caviard.integrations.litellm.CaviardLogger`: LiteLLM callback that redacts
@@ -32,3 +33,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
 - `caviard.integrations.logging`: `RedactingFilter` for the standard `logging`
   module (message, arguments, exception, stack and extra fields), `install()` and a
   structlog processor.
+- `caviard audit`: offline analysis of exported traces and logs (OTLP JSON from the
+  OpenTelemetry Collector, JSON Lines, JSON arrays or text, optionally gzipped).
+  Reports which personal data they hold, where (attribute keys, services,
+  instrumentations), warnings such as allowed keys that expose data, and a proposed
+  policy. Text, JSON and self-contained HTML outputs hold no analysed value;
+  `--examples` adds redacted excerpts on request.
+- `caviard policy check`: validates a policy file and shows its effective settings,
+  with warnings for unknown entities, conflicting key rules and missing pseudonym keys.
+- `caviard bench`: speed and identifier recall on synthetic French agent traces
+  generated on the machine.

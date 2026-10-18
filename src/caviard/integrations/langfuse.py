@@ -9,9 +9,10 @@
 Langfuse drops a whole export batch when the hook raises, so every span is
 handled on its own: a span whose redaction fails is quarantined (only allowed
 attributes keep their value) while the rest of the batch is exported. Langfuse
-only lets the hook change attributes; span events (exception messages) are
-not covered here. Wrap the exporter with ``caviard.otel.RedactingSpanExporter``
-(``Langfuse(span_exporter=...)``) to cover them too.
+only lets the hook change span attributes: span names, events (exception
+messages) and resource attributes are not covered here. Wrap the exporter with
+``caviard.otel.RedactingSpanExporter`` (``Langfuse(span_exporter=...)``) to
+cover them too.
 """
 
 from __future__ import annotations

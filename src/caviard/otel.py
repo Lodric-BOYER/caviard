@@ -7,9 +7,9 @@ so redaction runs on the export thread, off the request path::
     provider.add_span_processor(BatchSpanProcessor(exporter))
 
 Spans are immutable once ended: the wrapper exports redacted copies (name,
-attributes, events, links and status description) and never modifies the
-original. If a span cannot be redacted it is quarantined (only allowed
-attributes keep their value) or dropped, never exported in clear.
+attributes, events, links, status description and resource attributes) and
+never modifies the original. If a span cannot be redacted it is quarantined
+(only allowed attributes keep their value) or dropped, never exported in clear.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 try:
+    from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import Event, ReadableSpan
     from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
     from opentelemetry.trace import Link, Status
@@ -37,6 +38,7 @@ __all__ = ["QUARANTINED", "QUARANTINE_FLAG", "RedactingSpanExporter"]
 
 QUARANTINED = "[QUARANTINED]"
 QUARANTINE_FLAG = "caviard.quarantined"
+_RESOURCE_CACHE = 64
 
 
 class RedactingSpanExporter(SpanExporter):
@@ -56,6 +58,7 @@ class RedactingSpanExporter(SpanExporter):
         )
         self._lock = threading.Lock()
         self._counts: Counter[str] = Counter()
+        self._resources: dict[int, tuple[Resource, Resource]] = {}
 
     @property
     def counters(self) -> dict[str, int]:
@@ -108,14 +111,22 @@ class RedactingSpanExporter(SpanExporter):
             events=events,
             links=links,
             status=status,
+            resource=self._resource(span.resource),
         )
 
+    def _resource(self, resource: Resource) -> Resource:
+        """Redacted copy of a resource, cached so that its spans still share one."""
+        cached = self._resources.get(id(resource))
+        if cached is not None and cached[0] is resource:
+            return cached[1]
+        redacted = Resource(_attributes(self.redactor, resource.attributes), resource.schema_url)
+        if len(self._resources) >= _RESOURCE_CACHE:
+            self._resources.clear()
+        self._resources[id(resource)] = (resource, redacted)
+        return redacted
+
     def _quarantine(self, span: ReadableSpan) -> ReadableSpan:
-        policy = self.redactor.policy
-        attributes: dict[str, Any] = {
-            key: value if policy.key_decision(key) == "allow" else QUARANTINED
-            for key, value in (span.attributes or {}).items()
-        }
+        attributes = self._allowed_only(span.attributes)
         attributes[QUARANTINE_FLAG] = True
         return _copy(
             span,
@@ -124,7 +135,15 @@ class RedactingSpanExporter(SpanExporter):
             events=[],
             links=[Link(link.context) for link in span.links],
             status=Status(span.status.status_code),
+            resource=Resource(self._allowed_only(span.resource.attributes)),
         )
+
+    def _allowed_only(self, attributes: Attributes) -> dict[str, Any]:
+        policy = self.redactor.policy
+        return {
+            key: value if policy.key_decision(key) == "allow" else QUARANTINED
+            for key, value in (attributes or {}).items()
+        }
 
 
 def _attributes(redactor: Redactor, attributes: Attributes) -> dict[str, Any]:
@@ -139,12 +158,13 @@ def _copy(
     events: list[Event],
     links: list[Link],
     status: Status,
+    resource: Resource,
 ) -> ReadableSpan:
     return ReadableSpan(
         name=name,
         context=span.context,
         parent=span.parent,
-        resource=span.resource,
+        resource=resource,
         attributes=attributes,
         events=events,
         links=links,

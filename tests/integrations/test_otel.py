@@ -6,6 +6,7 @@ import json
 
 import pytest
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
@@ -27,9 +28,11 @@ _REMOTE = SpanContext(
 )
 
 
-def _pipeline(exporter: RedactingSpanExporter) -> tuple[TracerProvider, InMemorySpanExporter]:
+def _pipeline(
+    exporter: RedactingSpanExporter, resource: Resource | None = None
+) -> tuple[TracerProvider, InMemorySpanExporter]:
     """A provider exporting through ``exporter`` and, in parallel, to a raw exporter."""
-    provider = TracerProvider()
+    provider = TracerProvider(resource=resource) if resource else TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     raw = InMemorySpanExporter()
     provider.add_span_processor(SimpleSpanProcessor(raw))
@@ -113,10 +116,37 @@ def test_original_spans_are_not_modified(pii: dict[str, str]) -> None:
     assert captured[0] is not original
 
 
+def _resource(pii: dict[str, str]) -> Resource:
+    return Resource.create(
+        {
+            "service.name": "support-agent",
+            "process.command_line": f"python agent.py --api-key {pii['api_key']}",
+            "deployment.owner": pii["email"],
+        }
+    )
+
+
+def test_resource_attributes_are_redacted_once_per_resource(pii: dict[str, str]) -> None:
+    inner = InMemorySpanExporter()
+    exporter = RedactingSpanExporter(inner, redactor=make_redactor())
+    provider, raw = _pipeline(exporter, _resource(pii))
+    tracer = provider.get_tracer("tests")
+    for name in ("plan", "act"):
+        with tracer.start_as_current_span(name):
+            pass
+
+    first, second = inner.get_finished_spans()
+    assert first.resource is second.resource  # still one resource group on the wire
+    assert first.resource.attributes["service.name"] == "support-agent"
+    assert leaked(encode_spans([first, second]).SerializeToString(), pii.values()) == []
+    raw_wire = encode_spans(raw.get_finished_spans()).SerializeToString()
+    assert pii["api_key"].encode() in raw_wire
+
+
 def test_quarantine_keeps_only_allowed_attributes(pii: dict[str, str]) -> None:
     inner = InMemorySpanExporter()
     exporter = RedactingSpanExporter(inner, redactor=exploding_redactor())
-    provider, _ = _pipeline(exporter)
+    provider, _ = _pipeline(exporter, _resource(pii))
     _agent_span(provider, pii)
 
     (span,) = inner.get_finished_spans()
@@ -130,6 +160,8 @@ def test_quarantine_keeps_only_allowed_attributes(pii: dict[str, str]) -> None:
     assert not span.links[0].attributes
     assert span.status.status_code is StatusCode.ERROR
     assert span.status.description is None
+    assert span.resource.attributes["service.name"] == "support-agent"
+    assert span.resource.attributes["process.command_line"] == QUARANTINED
     assert exporter.counters == {"quarantined": 1}
 
 
@@ -185,3 +217,22 @@ def test_batch_processor_flush_and_shutdown(pii: dict[str, str]) -> None:
     assert len({(span.attributes or {})["gen_ai.prompt"] for span in spans}) == 1
     provider.shutdown()
     assert exporter.counters == {"redacted": 5}
+
+
+def test_resource_cache_is_bounded(pii: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
+    import caviard.otel
+
+    monkeypatch.setattr(caviard.otel, "_RESOURCE_CACHE", 1)
+    inner = InMemorySpanExporter()
+    exporter = RedactingSpanExporter(inner, redactor=make_redactor())
+    for owner in ("a@exemple.fr", "b@exemple.fr"):
+        provider = TracerProvider(resource=Resource.create({"deployment.owner": owner}))
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        with provider.get_tracer("tests").start_as_current_span("step"):
+            pass
+    first, second = inner.get_finished_spans()
+    assert first.resource is not second.resource
+    assert (
+        leaked(encode_spans([first, second]).SerializeToString(), ["a@exemple.fr", "b@exemple.fr"])
+        == []
+    )
