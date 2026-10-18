@@ -1,0 +1,134 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "caviard"
+dynamic = ["version"]
+description = "Fail-closed redaction of personal data and secrets in AI agent traces and logs (OpenTelemetry, Langfuse, LiteLLM), with checksum-validated French and EU identifiers."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+authors = [{ name = "Lodric BOYER" }]
+keywords = [
+  "pii", "gdpr", "rgpd", "redaction", "privacy", "opentelemetry",
+  "langfuse", "litellm", "llm", "ai-agents", "observability",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Security",
+  "Topic :: System :: Logging",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+otel = ["opentelemetry-sdk>=1.27"]
+langfuse = ["langfuse>=5"]
+litellm = ["litellm>=1.60,!=1.82.7,!=1.82.8"]
+yaml = ["pyyaml>=6"]
+audit = ["jinja2>=3.1"]
+
+[project.urls]
+Homepage = "https://github.com/Lodric-BOYER/caviard"
+Source = "https://github.com/Lodric-BOYER/caviard"
+Issues = "https://github.com/Lodric-BOYER/caviard/issues"
+Changelog = "https://github.com/Lodric-BOYER/caviard/blob/main/CHANGELOG.md"
+
+[project.scripts]
+caviard = "caviard.cli:main"
+
+[dependency-groups]
+test = [
+  "pytest>=8.3",
+  "pytest-cov>=6",
+  "pytest-timeout>=2.3",
+  "hypothesis>=6.120",
+  "faker>=30",
+  "opentelemetry-sdk>=1.27",
+  "opentelemetry-exporter-otlp-proto-common>=1.27",
+  "pyyaml>=6",
+  "jinja2>=3.1",
+]
+integrations = [
+  "langfuse>=5",
+  "litellm>=1.60,!=1.82.7,!=1.82.8",
+]
+lint = [
+  "ruff>=0.9",
+  "mypy>=1.14",
+  "types-PyYAML",
+]
+release = [
+  "build>=1.2",
+  "twine>=6.1",
+]
+dev = [
+  { include-group = "test" },
+  { include-group = "integrations" },
+  { include-group = "lint" },
+  { include-group = "release" },
+]
+
+[tool.hatch.version]
+path = "src/caviard/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/caviard"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/caviard",
+  "tests",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "pyproject.toml",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "C4", "PT"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311", "S603"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["src/caviard"]
+
+[[tool.mypy.overrides]]
+module = ["langfuse.*", "litellm.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+timeout = 120
+markers = [
+  "integration: tests that need optional third-party packages (langfuse, litellm)",
+  "slow: tests that take more than a few seconds",
+]
+
+[tool.coverage.run]
+source = ["caviard"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
