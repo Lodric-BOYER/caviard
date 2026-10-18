@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_NO_PROGRESS: "1"
+  # LiteLLM downloads its model price list at import unless told to use its copy.
+  LITELLM_LOCAL_MODEL_COST_MAP: "True"
+
+jobs:
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv venv --python 3.13
+      - run: uv pip install -e . --group lint --group integrations
+      - run: uv run --no-sync ruff check .
+      - run: uv run --no-sync ruff format --check .
+      - run: uv run --no-sync mypy
+
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv venv --python ${{ matrix.python }}
+      - run: uv pip install -e . --group test --group integrations
+      - run: uv run --no-sync pytest --cov
+
+  security:
+    name: Dependencies and code scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv venv --python 3.13
+      - run: uv pip install -e ".[otel,langfuse,litellm,yaml]" pip-audit bandit
+      - name: Known vulnerabilities in what users install
+        run: uv run --no-sync pip-audit --skip-editable --progress-spinner off
+      - name: Static analysis
+        run: uv run --no-sync bandit -q -r src
+
+  build:
+    name: Build and install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: Install the wheel in a clean environment
+        run: |
+          uv venv /tmp/clean --python 3.13
+          uv pip install --python /tmp/clean/bin/python dist/*.whl
+          /tmp/clean/bin/caviard --version
+          /tmp/clean/bin/caviard scan --check "rien à signaler"
+          /tmp/clean/bin/python -c "import caviard; assert caviard.redact('jean@exemple.fr').startswith('[EMAIL')"

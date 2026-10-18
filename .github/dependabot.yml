@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # Actions are pinned by commit: Dependabot proposes the new commits.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
