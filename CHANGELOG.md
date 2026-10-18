@@ -20,3 +20,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   `debug-local`, `none`).
 - Detector plugins through the `caviard.detectors` entry point group.
 - `caviard scan` and `caviard keygen` commands.
+- `caviard.otel.RedactingSpanExporter`: wraps any OpenTelemetry span exporter and
+  exports redacted copies of span names, attributes, events, links and status
+  messages. A span that cannot be redacted is quarantined or dropped (`on_error`).
+- `caviard.integrations.langfuse.mask_otel_spans`: hook for the Langfuse SDK v5. Each
+  span is handled on its own, so one failure never drops the whole export batch.
+- `caviard.integrations.litellm.CaviardLogger`: LiteLLM callback that redacts
+  messages, metadata, raw request and response bodies, the standard logging payload
+  and responses (sync, async and streaming) before other callbacks see them, without
+  touching the objects held by the application.
+- `caviard.integrations.logging`: `RedactingFilter` for the standard `logging`
+  module (message, arguments, exception, stack and extra fields), `install()` and a
+  structlog processor.

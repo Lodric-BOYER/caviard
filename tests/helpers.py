@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import re
 import string
+from collections.abc import Iterable
 from typing import Any
 
-from caviard import Policy, Redactor
+from caviard import Detector, Policy, Redactor
 from caviard.core.checksums import luhn_ok
 
 TEST_KEY = "a" * 64  # hex-encoded 32-byte key, for tests only
@@ -34,3 +37,38 @@ def nir_with_key(body: str) -> str:
 
 def spaced_nir(nir: str) -> str:
     return f"{nir[0]} {nir[1:3]} {nir[3:5]} {nir[5:7]} {nir[7:10]} {nir[10:13]} {nir[13:]}"
+
+
+def _explode(value: str) -> bool:
+    raise RuntimeError("detector failure")
+
+
+def exploding_redactor(policy: Policy | None = None, **changes: Any) -> Redactor:
+    """A Redactor whose extra detector fails on every word, to exercise quarantine paths."""
+    base = policy if policy is not None else Policy.default()
+    explode = Detector("explode", "BOOM", re.compile(r"\w+"), validate=_explode)
+    return Redactor(
+        base.replace(plugins=False, **changes), extra_detectors=[explode], pseudonym_key=TEST_KEY
+    )
+
+
+def _fallback(value: Any) -> Any:
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump()
+        except Exception:
+            return repr(value)
+    return repr(value)
+
+
+def dump(value: Any) -> str:
+    """Serialise anything (objects included) to search it for raw values."""
+    return json.dumps(value, default=_fallback, ensure_ascii=False)
+
+
+def leaked(text: str | bytes, values: Iterable[str]) -> list[str]:
+    """The raw values found in ``text``; an empty list means nothing leaked."""
+    if isinstance(text, bytes):
+        return [value for value in values if value.encode() in text]
+    return [value for value in values if value in text]
