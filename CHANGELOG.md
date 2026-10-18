@@ -43,3 +43,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/).
   with warnings for unknown entities, conflicting key rules and missing pseudonym keys.
 - `caviard bench`: speed and identifier recall on synthetic French agent traces
   generated on the machine.
+- Documentation: README in English and French, security policy (`SECURITY.md`) and
+  threat model (`THREAT_MODEL.md`).
+- Releases are built from version tags and published with PyPI Trusted Publishing; CI
+  runs tests on Linux, Windows and macOS (Python 3.11 to 3.14), pip-audit, bandit,
+  CodeQL and OpenSSF Scorecard.
