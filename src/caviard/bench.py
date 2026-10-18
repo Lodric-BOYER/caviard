@@ -36,7 +36,8 @@ class Synthetic:
     """Deterministic generator of fictional identifiers with valid check digits."""
 
     def __init__(self, seed: int = 2026) -> None:
-        self.rng = random.Random(seed)  # noqa: S311 (reproducible test data, not security)
+        # A seeded generator on purpose: reproducible test data, nothing secret.
+        self.rng = random.Random(seed)  # noqa: S311  # nosec B311
 
     def digits(self, count: int) -> str:
         return "".join(self.rng.choice(string.digits) for _ in range(count))

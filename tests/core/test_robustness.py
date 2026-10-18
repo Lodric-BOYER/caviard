@@ -39,11 +39,20 @@ def test_hostile_text_is_bounded(name: str) -> None:
     assert time.perf_counter() - start < LIMIT_SECONDS
 
 
-@pytest.mark.parametrize("payload", ["[" * MEGABYTE, '{"a":' * (MEGABYTE // 5), "{" * MEGABYTE])
-def test_hostile_json_is_bounded(payload: str) -> None:
+# Named, not passed directly: pytest puts test ids in an environment variable, which
+# Windows limits to 32,767 characters.
+JSON_PAYLOADS = {
+    "nested arrays": "[" * MEGABYTE,
+    "nested objects": '{"a":' * (MEGABYTE // 5),
+    "open braces": "{" * MEGABYTE,
+}
+
+
+@pytest.mark.parametrize("name", list(JSON_PAYLOADS))
+def test_hostile_json_is_bounded(name: str) -> None:
     redactor = make_redactor(max_chars=2 * MEGABYTE)
     start = time.perf_counter()
-    redactor.redact_value(payload)
+    redactor.redact_value(JSON_PAYLOADS[name])
     assert time.perf_counter() - start < LIMIT_SECONDS
 
 

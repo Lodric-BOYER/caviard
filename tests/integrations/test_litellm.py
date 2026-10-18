@@ -33,6 +33,22 @@ QUARANTINED = integration.QUARANTINED
 CaviardLogger = integration.CaviardLogger
 
 
+def _tokenizer_loads() -> bool:
+    try:
+        from litellm.litellm_core_utils import default_encoding  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+# LiteLLM counts streamed tokens with tiktoken. Its Windows wheels (1.106) ship tokenizer
+# files with Windows line endings: tiktoken rejects them and downloads them again, which
+# fails offline or behind a TLS-inspecting proxy. Without a tokenizer there is no stream.
+needs_tokenizer = pytest.mark.skipif(
+    not _tokenizer_loads(), reason="LiteLLM cannot load its tokenizer on this machine"
+)
+
+
 def _visible(kwargs: dict[str, Any]) -> dict[str, Any]:
     # The exception object is passed through on purpose (see the module docstring).
     return {key: value for key, value in kwargs.items() if key != "exception"}
@@ -161,6 +177,7 @@ def test_sync_completion(capture: Capture, pii: dict[str, str]) -> None:
     assert caviard.redactor.stats.snapshot()["EMAIL"] >= 1
 
 
+@needs_tokenizer
 def test_sync_stream(capture: Capture, pii: dict[str, str]) -> None:
     litellm.callbacks = [CaviardLogger(redactor=make_redactor()), capture]
     answer = f"Votre conseiller vous écrira à {pii['email']}."
@@ -183,7 +200,8 @@ def test_sync_stream(capture: Capture, pii: dict[str, str]) -> None:
     assert "[EMAIL:" in streamed.choices[0].message.content
 
 
-def test_async_completion_and_stream(capture: Capture, pii: dict[str, str]) -> None:
+@pytest.mark.parametrize("stream", [pytest.param(True, marks=needs_tokenizer), False])
+def test_async_completion(capture: Capture, pii: dict[str, str], stream: bool) -> None:
     legacy = Legacy()  # makes LiteLLM also run its sync handler, in a thread
     litellm.callbacks = [CaviardLogger(redactor=make_redactor()), capture]
     litellm.success_callback = [legacy]
@@ -191,13 +209,17 @@ def test_async_completion_and_stream(capture: Capture, pii: dict[str, str]) -> N
     answer = f"Nous vous écrirons à {pii['email']}."
 
     async def scenario() -> str:
-        response = await litellm.acompletion(model=MODEL, messages=messages, mock_response=answer)
-        assert response.choices[0].message.content == answer
-        stream = await litellm.acompletion(
-            model=MODEL, messages=messages, mock_response=answer, stream=True
-        )
-        text = "".join([chunk.choices[0].delta.content or "" async for chunk in stream])
-        await _async_wait_for(lambda: capture.count("async_success") >= 2)
+        if stream:
+            response = await litellm.acompletion(
+                model=MODEL, messages=messages, mock_response=answer, stream=True
+            )
+            text = "".join([chunk.choices[0].delta.content or "" async for chunk in response])
+        else:
+            response = await litellm.acompletion(
+                model=MODEL, messages=messages, mock_response=answer
+            )
+            text = response.choices[0].message.content
+        await _async_wait_for(lambda: capture.count("async_success") >= 1)
         return text
 
     assert asyncio.run(scenario()) == answer
