@@ -206,7 +206,7 @@ detectors.
 2. **Replace.** Each type has an action: mask, pseudonymise (HMAC-SHA256 with your key,
    normalised so that `06 12 34 56 78` and `+33 6 12 34 56 78` share a token), partial
    or keep. JSON strings, including double-encoded tool arguments, are redacted field by
-   field.
+   field; anything nested deeper than 64 levels, or too deep to parse, is replaced.
 3. **Never leak on error.** If anything fails, integrations quarantine the record (only
    allowed attributes keep their value) or drop it.
 

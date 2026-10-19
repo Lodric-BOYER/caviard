@@ -76,10 +76,24 @@ def test_unchanged_json_is_returned_verbatim(redactor: Redactor) -> None:
     assert redactor.redact_value(text) is text
 
 
+@pytest.mark.parametrize("levels", [100, 5_000, 20_000, 100_000])
+def test_deep_json_fails_closed(fake: Faker, levels: int) -> None:
+    # Whether the parser accepts these depths depends on the Python version and the
+    # stack size (Python 3.14.8 on Linux parses 100,000 levels, 3.11 stops near
+    # 1,000): either way a hidden field must not come back through the text path.
+    redactor = make_redactor(max_chars=1_000_000)
+    name = fake.name()
+    hidden = json.dumps({"customer_name": name}, ensure_ascii=False)
+    document = "[" * levels + hidden + "]" * levels
+    output = redactor.redact_value(document)
+    assert name not in output
+    assert "[REDACTED]" in output
+    assert len(output) < 200
+    assert redactor.redact_value(output) == output
+
+
 def test_hostile_json(fake: Faker) -> None:
     redactor = make_redactor(max_chars=1_000_000)
-    deep = "[" * 100_000 + "]" * 100_000
-    assert redactor.redact_value(deep) == deep
     nested: object = {"contact": fake.email()}
     for _ in range(100):
         nested = {"child": nested}

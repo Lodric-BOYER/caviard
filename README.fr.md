@@ -195,7 +195,8 @@ passent par les détecteurs.
 2. **Remplacer.** Chaque type a une action : masquer, pseudonymiser (HMAC-SHA256 avec
    votre clé, après normalisation : `06 12 34 56 78` et `+33 6 12 34 56 78` donnent le même
    jeton), garder la fin ou conserver. Les chaînes JSON, y compris les arguments d'outils
-   encodés deux fois, sont masquées champ par champ.
+   encodés deux fois, sont masquées champ par champ ; ce qui est imbriqué au-delà de
+   64 niveaux, ou trop profond pour être lu, est remplacé.
 3. **Ne jamais fuir sur erreur.** En cas d'échec, les intégrations mettent
    l'enregistrement en quarantaine (seuls les attributs autorisés gardent leur valeur) ou
    le suppriment.

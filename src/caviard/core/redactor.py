@@ -261,8 +261,14 @@ class Redactor:
         if depth < self.policy.json_max_depth and text.lstrip()[:1] in ("{", "["):
             try:
                 parsed = json.loads(text)
-            except (ValueError, RecursionError):
+            except ValueError:
                 parsed = None
+            except RecursionError:
+                # Too deep for this interpreter (the limit varies with the Python
+                # version and the stack size): the text fallback would skip the
+                # field-name rules, so fail closed instead.
+                self.stats.add(E.REDACTED)
+                return _REDACTED
             if isinstance(parsed, dict | list):
                 redacted, changed = self._walk(parsed, hint, depth + 1, 0)
                 return json.dumps(redacted, ensure_ascii=False) if changed else text
