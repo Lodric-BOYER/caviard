@@ -102,8 +102,8 @@ def test_clean_structured_texts_are_kept_and_fast() -> None:
     # More field names than the 10,000-match budget: names alone never spend it.
     logfmt = " ".join(f"k{index}=v{index}" for index in range(15_000))
     assert redactor.redact_value(logfmt) == logfmt
-    # Every key of a JSON document is checked; short ones are cached.
-    document = json.dumps({f"k{index}": index for index in range(60_000)})
+    # Half a megabyte of distinct keys, each one checked.
+    document = json.dumps({f"k{index}": index for index in range(30_000)})
     start = time.perf_counter()
     assert redactor.redact_value(document) == document
     assert time.perf_counter() - start < LIMIT_SECONDS

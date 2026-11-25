@@ -66,9 +66,14 @@ class EntityRule:
     keep_last: int = 4
 
 
+_NOT_ALNUM = re.compile(r"[^0-9a-z]+")
+
+
 @functools.lru_cache(maxsize=4096)
 def normalize_field(name: str) -> str:
     """Lowercase, strip accents, keep letters and digits: "Prénom" -> "prenom"."""
+    if name.isascii():  # the same result, without decomposing
+        return _NOT_ALNUM.sub("", name.lower())
     decomposed = unicodedata.normalize("NFKD", name.lower())
     return "".join(char for char in decomposed if char.isascii() and char.isalnum())
 
@@ -324,9 +329,17 @@ class Policy:
     key_file: str | None = None
     pseudonym_length: int = 12
     plugins: bool = True
-    _matchers: tuple[tuple[KeyDecision, re.Pattern[str]], ...] = field(init=False, repr=False)
-    _decisions: dict[str, KeyDecision | None] = field(init=False, repr=False)
-    _field_patterns: re.Pattern[str] | None = field(init=False, repr=False)
+    # Derived from the fields above, and caches: never compared.
+    _matchers: tuple[tuple[KeyDecision, re.Pattern[str]], ...] = field(
+        init=False, repr=False, compare=False
+    )
+    _decisions: dict[str, KeyDecision | None] = field(init=False, repr=False, compare=False)
+    _field_contains: re.Pattern[str] | None = field(init=False, repr=False, compare=False)
+    _field_affixes: tuple[tuple[str, ...], tuple[str, ...]] = field(
+        init=False, repr=False, compare=False
+    )
+    _field_patterns: re.Pattern[str] | None = field(init=False, repr=False, compare=False)
+    _field_answers: dict[str, bool] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         groups: tuple[tuple[KeyDecision, tuple[str, ...]], ...] = (
@@ -343,7 +356,12 @@ class Policy:
         fields = frozenset(_normalize_pattern(name) for name in self.sensitive_fields)
         object.__setattr__(self, "sensitive_fields", fields)
         patterns = sorted(name for name in fields if "*" in name or "?" in name)
-        object.__setattr__(self, "_field_patterns", _compile_globs(patterns) if patterns else None)
+        contains, prefixes, suffixes, others = _split_globs(patterns)
+        found = re.compile("|".join(map(re.escape, contains))) if contains else None
+        object.__setattr__(self, "_field_contains", found)
+        object.__setattr__(self, "_field_affixes", (prefixes, suffixes))
+        object.__setattr__(self, "_field_patterns", _compile_globs(others) if others else None)
+        object.__setattr__(self, "_field_answers", {})
 
     # Construction
 
@@ -425,8 +443,23 @@ class Policy:
         """
         if not self.sensitive_fields or len(name) > _MAX_FIELD_NAME:
             return False
-        normal = normalize_field(name)
+        try:
+            return self._field_answers[name]
+        except KeyError:
+            pass
+        answer = self._matches_field(normalize_field(name))
+        if len(self._field_answers) >= 4096:
+            self._field_answers.clear()
+        self._field_answers[name] = answer
+        return answer
+
+    def _matches_field(self, normal: str) -> bool:
         if normal in self.sensitive_fields:
+            return True
+        if self._field_contains is not None and self._field_contains.search(normal):
+            return True
+        prefixes, suffixes = self._field_affixes
+        if normal.startswith(prefixes) or normal.endswith(suffixes):
             return True
         return self._field_patterns is not None and self._field_patterns.match(normal) is not None
 
@@ -471,6 +504,28 @@ class Policy:
             pseudonym_length=_int(pseudonym.get("length", 12), "pseudonym.length", 8, 32),
             plugins=plugins,
         )
+
+
+def _split_globs(
+    patterns: Iterable[str],
+) -> tuple[list[str], tuple[str, ...], tuple[str, ...], list[str]]:
+    """Patterns as plain tests where possible: "*word*" looks for a substring, "word*"
+    for a prefix, "*word" for a suffix. The others are returned as they are."""
+    contains: list[str] = []
+    prefixes: list[str] = []
+    suffixes: list[str] = []
+    others: list[str] = []
+    for pattern in patterns:
+        core = pattern.strip("*")
+        if not core or "*" in core or "?" in core:
+            others.append(pattern)
+        elif pattern.startswith("*") and pattern.endswith("*"):
+            contains.append(core)
+        elif pattern.endswith("*"):
+            prefixes.append(core)
+        else:
+            suffixes.append(core)
+    return contains, tuple(prefixes), tuple(suffixes), others
 
 
 def _compile_globs(patterns: Iterable[str]) -> re.Pattern[str]:

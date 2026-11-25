@@ -282,3 +282,24 @@ def test_long_keys_are_not_cached() -> None:
     key = "app." + "x" * 5_000
     assert policy.key_decision(key) is None
     assert key not in policy._decisions
+
+
+def test_field_patterns_match_like_fnmatch() -> None:
+    patterns = ["*a?b*", "x*y", "pre*", "*post", "**mid**", "q?"]
+    policy = Policy.from_dict({"preset": "none", "json": {"sensitive_fields": patterns}})
+    expected = {
+        "zz_axb_zz": True,
+        "ab": False,
+        "xky": True,
+        "xy": True,
+        "prefix": True,
+        "apre": False,
+        "signpost": True,
+        "postal": False,
+        "amidst": True,
+        "q1": True,
+        "q12": False,
+    }
+    for name, sensitive in expected.items():
+        assert policy.is_sensitive_field(name) is sensitive, name
+        assert policy.is_sensitive_field(name) is sensitive, name  # remembered answer

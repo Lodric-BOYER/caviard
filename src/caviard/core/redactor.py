@@ -216,6 +216,11 @@ class Redactor:
             (d, re.compile("|".join(map(re.escape, d.triggers))) if d.triggers else None)
             for d in self._detectors
         )
+        # Most short texts (keys, names, statuses) hold no trigger at all: one search
+        # tells, and only the detectors without triggers are left to consider.
+        triggers = sorted({trigger for d in self._detectors for trigger in d.triggers})
+        self._any_trigger = re.compile("|".join(map(re.escape, triggers))) if triggers else None
+        self._ungated = tuple((d, gate) for d, gate in self._gates if gate is None)
         self._clean_keys: dict[str, None] = {}  # short mapping keys found clean
 
     @property
@@ -268,11 +273,14 @@ class Redactor:
         text lacks its triggers, required substrings or digits."""
         lowered = text.lower()
         digits = digit_count(lowered)
+        gates = self._gates
+        if self._any_trigger is not None and self._any_trigger.search(lowered) is None:
+            gates = self._ungated
         found: list[Finding] = []
-        for detector, gate in self._gates:
-            if gate is not None and gate.search(lowered) is None:
-                continue
+        for detector, gate in gates:
             if detector.min_digits > digits:
+                continue
+            if gate is not None and gate.search(lowered) is None:
                 continue
             if type(detector) is Detector:  # gated here already
                 if detector.requires and not all(r in lowered for r in detector.requires):
