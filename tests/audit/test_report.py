@@ -71,3 +71,13 @@ def test_text_summary_lists_warnings() -> None:
     assert render_text(audit.summary()).endswith(
         "Warnings:\n  - 1 binary value(s) were not analysed: they are replaced entirely at export."
     )
+
+
+def test_text_summary_escapes_terminal_sequences() -> None:
+    audit = Auditor()
+    hostile = "app.\x1b[2J\u202ekey"  # clears the screen, then reverses the text
+    audit.add(Record("span", fields=[Field("span", hostile, "jean@exemple.fr")]))
+    text = render_text(audit.summary())
+    assert "\x1b" not in text
+    assert "\u202e" not in text
+    assert "app.\\u001b[2J\\u202ekey [span]" in text

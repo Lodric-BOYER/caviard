@@ -8,8 +8,12 @@ from __future__ import annotations
 import asyncio
 import copy
 import datetime
+import gc
 import json
 import time
+import traceback
+import warnings
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from types import MappingProxyType
@@ -17,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from caviard import OnError
+from caviard import CaviardWarning, OnError
 from helpers import dump, exploding_redactor, leaked, make_redactor
 
 pytestmark = [
@@ -50,8 +54,12 @@ needs_tokenizer = pytest.mark.skipif(
 
 
 def _visible(kwargs: dict[str, Any]) -> dict[str, Any]:
-    # The exception object is passed through on purpose (see the module docstring).
-    return {key: value for key, value in kwargs.items() if key != "exception"}
+    """What a logger can read; the exception is rendered as loggers render it."""
+    visible = dict(kwargs)
+    error = visible.get("exception")
+    if isinstance(error, BaseException):
+        visible["exception"] = [repr(error), *traceback.format_exception(error)]
+    return visible
 
 
 class Capture(litellm.integrations.custom_logger.CustomLogger):
@@ -233,6 +241,86 @@ def test_async_completion(capture: Capture, pii: dict[str, str], stream: bool) -
         assert leaked(seen, pii.values()) == []
 
 
+def _async_hooks(caviard: Any, states: list[dict[str, Any]]) -> list[Any]:
+    """What the async callbacks receive for each logging state."""
+
+    async def run() -> list[Any]:
+        results = []
+        for state in states:
+            redacted, _ = await caviard.async_logging_hook(state, None, "acompletion")
+            results.append(redacted)
+        return results
+
+    return asyncio.run(run())
+
+
+def test_streamed_async_state_is_redacted_again(pii: dict[str, str]) -> None:
+    """LiteLLM 1.108 and later: once the async callbacks ran, the sync handler writes the
+    assembled response into the state they received, then hands the sync hook a copy."""
+    caviard = CaviardLogger(redactor=make_redactor())
+    original: dict[str, Any] = {
+        "litellm_call_id": "call-1",
+        "stream": True,
+        "messages": [{"role": "user", "content": f"Mon mail : {pii['email']}"}],
+    }
+
+    [state] = _async_hooks(caviard, [original])
+
+    assert state == original
+    assert _is_clean(state, pii)
+    assert _is_clean(original, pii)
+    state["complete_streaming_response"] = litellm.ModelResponse(
+        choices=[{"message": {"role": "assistant", "content": f"Rappel au {pii['phone']}"}}]
+    )
+    copied = {**state, "standard_logging_object": {"response": f"Rappel au {pii['phone']}"}}
+
+    redacted, _ = caviard.logging_hook(copied, None, "acompletion")
+
+    assert redacted is copied
+    assert _is_clean(copied, pii)
+    assert _is_clean(state, pii)
+    message = state["complete_streaming_response"].choices[0].message
+    assert message.content.startswith("Rappel au [")
+    assert not caviard._streamed  # forgotten once redacted again
+
+
+def test_streamed_state_handed_back_to_the_sync_hook(pii: dict[str, str]) -> None:
+    """LiteLLM before 1.108 hands the sync hook the state itself."""
+    caviard = CaviardLogger(redactor=make_redactor())
+    [state] = _async_hooks(caviard, [{"litellm_call_id": "call-2", "stream": True}])
+    state["complete_streaming_response"] = f"Rappel au {pii['phone']}"
+
+    redacted, _ = caviard.logging_hook(state, None, "acompletion")
+
+    assert redacted is state
+    assert _is_clean(state, pii)
+    assert not caviard._streamed
+
+
+def test_streamed_states_are_never_kept_alive() -> None:
+    caviard = CaviardLogger(redactor=make_redactor())
+    plain = {"litellm_call_id": "plain", "stream": False}
+    assert _async_hooks(caviard, [plain]) == [plain]
+    assert not caviard._streamed  # only streamed calls get a sync handler run afterwards
+
+    count = integration._MAX_STREAMED + 3
+    states = _async_hooks(
+        caviard, [{"litellm_call_id": f"call-{n}", "stream": True} for n in range(count)]
+    )
+
+    assert len(caviard._streamed) == integration._MAX_STREAMED
+    assert "call-0" not in caviard._streamed  # the oldest go first
+    last = weakref.ref(states[-1])
+    del states
+    gc.collect()
+    assert last() is None  # weakly referenced: LiteLLM alone keeps a state alive
+    caviard.logging_hook({"litellm_call_id": f"call-{count - 1}"}, None, "acompletion")
+    assert f"call-{count - 1}" not in caviard._streamed
+    kept = _async_hooks(caviard, [{"litellm_call_id": "next", "stream": True}])
+    assert list(caviard._streamed) == ["next"]  # the dropped states are forgotten
+    assert caviard._streamed["next"]() is kept[0]
+
+
 def test_sync_failure(capture: Capture, pii: dict[str, str]) -> None:
     litellm.callbacks = [CaviardLogger(redactor=make_redactor()), capture]
 
@@ -250,6 +338,14 @@ def test_sync_failure(capture: Capture, pii: dict[str, str]) -> None:
     assert payload["status"] == "failure"
     assert "[EMAIL:" in payload["error_str"]
     assert "[EMAIL:" in kwargs["traceback_exception"]
+    # Loggers that record the exception itself (LiteLLM's OpenTelemetry one does) see a
+    # copy of the same class, with its status code and a redacted text.
+    error = kwargs["exception"]
+    assert isinstance(error, litellm.exceptions.InternalServerError)
+    assert error.status_code == 500
+    assert "[EMAIL:" in str(error)
+    assert error.__traceback__ is None  # frames hold local variables
+    assert "Traceback (most recent call last)" in error.__notes__[-1]
 
 
 def test_async_failure(capture: Capture, pii: dict[str, str]) -> None:
@@ -327,7 +423,10 @@ def test_logging_state_keeps_litellm_objects(pii: dict[str, str]) -> None:
     assert leaked(dump(_visible(details)), pii.values()) == []
     assert details["model"] == MODEL
     assert details["start_time"] is started
-    assert details["exception"] is error
+    # Loggers get a copy of the exception: same class, same text when it holds no data.
+    assert type(details["exception"]) is ValueError
+    assert details["exception"] is not error
+    assert str(details["exception"]) == str(error)
     assert details["api_key"] == "[REDACTED]"
     assert details["standard_callback_dynamic_params"] == {
         "langfuse_secret_key": "sk-lf-kept-as-is"
@@ -456,3 +555,97 @@ def test_quarantine_survives_unreadable_values(pii: dict[str, str]) -> None:
     details, _ = caviard.logging_hook(state, None, "completion")
     assert details["metadata"] == QUARANTINED
     assert details["user"] == QUARANTINED
+
+
+def test_mapping_keys_are_redacted(pii: dict[str, str]) -> None:
+    caviard = CaviardLogger(redactor=make_redactor())
+    state = {
+        "litellm_params": {"metadata": {"vip": {pii["email"]: {"tier": 1}}}},
+        "messages": [{"role": "user", "content": "ok", "extra": {pii["phone"]: "rappel"}}],
+    }
+    details, _ = caviard.logging_hook(state, None, "completion")
+    assert leaked(dump(details), pii.values()) == []
+    (key,) = details["litellm_params"]["metadata"]["vip"]
+    assert key.startswith("[EMAIL:")
+    assert details["litellm_params"]["metadata"]["vip"][key] == {"tier": 1}
+
+
+def test_quarantine_covers_keys_and_exceptions(pii: dict[str, str]) -> None:
+    caviard = CaviardLogger(redactor=exploding_redactor())
+    try:
+        raise RuntimeError(f"refused for {pii['email']}")
+    except RuntimeError as exc:
+        error = exc
+    state = {
+        "exception": error,
+        "metadata": {"by_mail": {pii["email"]: 1}, "total_tokens": 12},
+    }
+    details, _ = caviard.logging_hook(state, None, "completion")
+    assert leaked(dump(_visible(details)), pii.values()) == []
+    assert details["metadata"] == {"by_mail": {QUARANTINED: 1}, "total_tokens": 12}
+    assert type(details["exception"]) is RuntimeError
+    assert str(details["exception"]) == QUARANTINED
+
+
+@pytest.mark.parametrize(
+    ("installed", "warns"), [("1.85.0", True), ("1.87.4", False), ("1.106.0", False)]
+)
+def test_old_litellm_versions_are_flagged(
+    monkeypatch: pytest.MonkeyPatch, installed: str, warns: bool
+) -> None:
+    monkeypatch.setattr(integration.metadata, "version", lambda name: installed)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        CaviardLogger(redactor=make_redactor())
+    messages = [str(w.message) for w in caught if issubclass(w.category, CaviardWarning)]
+    if warns:
+        assert messages == [
+            f"LiteLLM {installed} runs the async and sync loggers of streamed calls at the "
+            "same time, so a logger may see unredacted data: upgrade to LiteLLM 1.87.4 or later"
+        ]
+    else:
+        assert messages == []
+
+
+class _PreCallLogger(litellm.integrations.custom_logger.CustomLogger):
+    """A logger that reads the request before it is sent."""
+
+    def log_pre_api_call(self, model: Any, messages: Any, kwargs: Any) -> None:
+        pass
+
+
+def test_loggers_that_read_raw_requests_are_flagged_once(
+    capture: Capture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    caviard_logger = CaviardLogger(redactor=make_redactor())
+    monkeypatch.setattr(litellm, "input_callback", [caviard_logger, capture, _PreCallLogger()])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            caviard_logger.log_pre_api_call(MODEL, [], {})
+    messages = [str(w.message) for w in caught if issubclass(w.category, CaviardWarning)]
+    assert messages == [
+        "LiteLLM hands the raw request to the log_pre_api_call and log_post_api_call hooks "
+        "of _PreCallLogger, before CaviardLogger can redact it: check that they record "
+        "nothing there, or export their spans through caviard.otel.RedactingSpanExporter"
+    ]
+
+
+def test_plain_loggers_are_not_flagged(capture: Capture, monkeypatch: pytest.MonkeyPatch) -> None:
+    caviard_logger = CaviardLogger(redactor=make_redactor())
+    monkeypatch.setattr(litellm, "input_callback", [caviard_logger, capture])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", CaviardWarning)
+        caviard_logger.log_pre_api_call(MODEL, [], {})
+
+
+def test_completion_with_a_pre_call_logger_warns(
+    capture: Capture, monkeypatch: pytest.MonkeyPatch, pii: dict[str, str]
+) -> None:
+    litellm.callbacks = [CaviardLogger(redactor=make_redactor()), capture, _PreCallLogger()]
+    with pytest.warns(CaviardWarning, match="_PreCallLogger"):
+        litellm.completion(
+            model=MODEL,
+            messages=[{"role": "user", "content": pii["email"]}],
+            mock_response="ok",
+        )

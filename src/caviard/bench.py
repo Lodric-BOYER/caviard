@@ -15,10 +15,12 @@ import statistics
 import string
 import time
 import unicodedata
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from caviard.core import entities as E
 from caviard.core.checksums import luhn_ok
 from caviard.core.policy import Policy
 from caviard.core.pseudonym import SecretKey
@@ -30,6 +32,8 @@ _FIRST = ("Camille", "Louis", "Chloé", "Hugo", "Inès", "Lucas", "Manon", "Nath
 _LAST = ("Martin", "Bernard", "Dubois", "Thomas", "Robert", "Petit", "Durand", "Leroy", "Moreau")
 _DOMAINS = ("exemple.fr", "example.com", "mail.test")
 _WARMUP = 20
+
+Identifiers = list[tuple[str, str]]  # (entity, value) pairs held by an input
 
 
 class Synthetic:
@@ -95,20 +99,32 @@ class Synthetic:
 
     # Texts: (text, identifiers it holds)
 
-    def message(self) -> tuple[str, list[str]]:
+    def message(self) -> tuple[str, Identifiers]:
         email, phone, nir = self.email(), self.phone(), self.nir()
         iban, card, siret = self.iban(), self.card(), self.siret()
         key, ip = self.api_key(), self.ip()
-        templates: list[tuple[str, list[str]]] = [
+        templates: list[tuple[str, Identifiers]] = [
             (
                 f"Bonjour, je suis {self.name()}. Mon numéro de sécurité sociale est {nir} "
                 f"et vous pouvez m'écrire à {email}.",
-                [nir, email],
+                [(E.FR_NIR, nir), (E.EMAIL, email)],
             ),
-            (f"Merci de rembourser sur l'IBAN {iban}, mon téléphone : {phone}.", [iban, phone]),
-            (f"Paiement refusé pour la carte bancaire {card}, client {email}.", [card, email]),
-            (f"Fournisseur ajouté : SIRET {siret}, contact au {phone}.", [siret, phone]),
-            (f"Erreur 401 avec la clé {key} depuis {ip}.", [key, ip]),
+            (
+                f"Merci de rembourser sur l'IBAN {iban}, mon téléphone : {phone}.",
+                [(E.IBAN, iban), (E.FR_PHONE, phone)],
+            ),
+            (
+                f"Paiement refusé pour la carte bancaire {card}, client {email}.",
+                [(E.CARD, card), (E.EMAIL, email)],
+            ),
+            (
+                f"Fournisseur ajouté : SIRET {siret}, contact au {phone}.",
+                [(E.FR_SIRET, siret), (E.FR_PHONE, phone)],
+            ),
+            (
+                f"Erreur 401 avec la clé {key} depuis {ip}.",
+                [(E.SECRET, key), (E.IP_ADDRESS, ip)],
+            ),
         ]
         return self.rng.choice(templates)
 
@@ -130,7 +146,7 @@ class Synthetic:
 class _Scenario:
     name: str
     inputs: list[Any]
-    values: list[list[str]]
+    values: list[Identifiers]
     run: Callable[[Any], Any]
     clean: bool = False
 
@@ -152,6 +168,7 @@ def run_bench(
         "count": count,
         "seed": seed,
         "scenarios": results,
+        "entities": _by_entity(results),
     }
 
 
@@ -192,16 +209,20 @@ def _measure(scenario: _Scenario) -> dict[str, Any]:
     for item in scenario.inputs[:_WARMUP]:
         scenario.run(item)
     timings: list[int] = []
-    missed = changed = 0
+    held: Counter[str] = Counter()
+    lost: Counter[str] = Counter()
+    changed = 0
     for item, values in zip(scenario.inputs, scenario.values, strict=True):
         start = time.perf_counter_ns()
         output = scenario.run(item)
         timings.append(time.perf_counter_ns() - start)
         text = _text(output)
-        missed += sum(1 for value in values if value in text)
+        for entity, value in values:
+            held[entity] += 1
+            lost[entity] += 1 if value in text else 0
         changed += 1 if scenario.clean and output != item else 0
     size = sum(len(_text(item).encode()) for item in scenario.inputs)
-    identifiers = sum(len(values) for values in scenario.values)
+    identifiers, missed = sum(held.values()), sum(lost.values())
     total_ns = max(1, sum(timings))
     return {
         "name": scenario.name,
@@ -214,6 +235,27 @@ def _measure(scenario: _Scenario) -> dict[str, Any]:
         "missed": missed,
         "recall": round(1 - missed / identifiers, 4) if identifiers else None,
         "changed_clean_inputs": changed if scenario.clean else None,
+        "by_entity": {
+            entity: {"identifiers": held[entity], "missed": lost[entity]} for entity in sorted(held)
+        },
+    }
+
+
+def _by_entity(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Recall of each entity type over all scenarios."""
+    held: Counter[str] = Counter()
+    lost: Counter[str] = Counter()
+    for row in results:
+        for entity, counts in row["by_entity"].items():
+            held[entity] += counts["identifiers"]
+            lost[entity] += counts["missed"]
+    return {
+        entity: {
+            "identifiers": held[entity],
+            "missed": lost[entity],
+            "recall": round(1 - lost[entity] / held[entity], 4),
+        }
+        for entity in sorted(held)
     }
 
 
@@ -235,17 +277,24 @@ def render_bench(result: dict[str, Any]) -> str:
             f"  {row['name']:<26}{row['inputs']:>7}{row['mean_us']:>10.1f}{row['p50_us']:>9.1f}"
             f"{row['p99_us']:>9.1f}{row['mb_per_s']:>8.2f}  {quality:<10}"
         )
+    lines += ["", f"  {'type':<26}{'identifiers':>12}{'missed':>8}  recall"]
+    for entity, counts in result["entities"].items():
+        lines.append(
+            f"  {entity:<26}{counts['identifiers']:>12}{counts['missed']:>8}  "
+            f"{counts['recall']:.1%}"
+        )
     lines += [
         "",
-        "Recall: share of synthetic identifiers removed. Names in free text are not detected;",
-        "clean messages must stay unchanged. Timings depend on this machine.",
+        "Recall: share of synthetic identifiers removed, in the formats this generator writes;",
+        "real traces hold more formats. Names in free text are not detected (no named-entity",
+        "recognition); clean messages must stay unchanged. Timings depend on this machine.",
     ]
     return "\n".join(lines)
 
 
-def _long_text(data: Synthetic) -> tuple[str, list[str]]:
+def _long_text(data: Synthetic) -> tuple[str, Identifiers]:
     lines: list[str] = []
-    values: list[str] = []
+    values: Identifiers = []
     size = 0
     while size < 8_000:
         if data.rng.random() < 0.1:
@@ -258,7 +307,7 @@ def _long_text(data: Synthetic) -> tuple[str, list[str]]:
     return "\n".join(lines), values
 
 
-def _span(data: Synthetic) -> tuple[dict[str, Any], list[str]]:
+def _span(data: Synthetic) -> tuple[dict[str, Any], Identifiers]:
     prompt, values = data.message()
     name, iban, phone = data.name(), data.iban(), data.phone()
     attributes = {
@@ -278,7 +327,7 @@ def _span(data: Synthetic) -> tuple[dict[str, Any], list[str]]:
     }
     # The name is replaced through its field name but not tracked: the same fictional
     # name may also appear in the prompt, where names are not detected.
-    return attributes, [*values, iban, phone]
+    return attributes, [*values, (E.IBAN, iban), (E.FR_PHONE, phone)]
 
 
 def _text(value: Any) -> str:

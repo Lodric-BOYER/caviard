@@ -11,7 +11,16 @@ import pytest
 
 import otlp
 from caviard import Policy
-from caviard.audit import Auditor, Field, Record, auditor, propose_policy, render_html, render_text
+from caviard.audit import (
+    Auditor,
+    Field,
+    Record,
+    auditor,
+    propose_policy,
+    readers,
+    render_html,
+    render_text,
+)
 from helpers import exploding_redactor, leaked
 
 
@@ -176,7 +185,13 @@ def test_skipped_values_and_warnings(pii: dict[str, str], monkeypatch: pytest.Mo
     audit.add(Record("span", fields=[Field("span", "new.key", "boom")]))
     summary = audit.summary()
 
-    assert summary["skipped"] == {"too_large": 1, "binary": 1, "errors": 1, "unreadable": 0}
+    assert summary["skipped"] == {
+        "too_large": 1,
+        "binary": 1,
+        "errors": 1,
+        "unreadable": 0,
+        "ignored": 0,
+    }
     codes = [warning["code"] for warning in summary["warnings"]]
     # A key name that cannot be checked is treated as holding personal data.
     assert codes == ["entity_kept", "personal_keys", "too_large", "binary", "errors"]
@@ -212,9 +227,51 @@ def test_unreadable_lines_are_reported(tmp_path: Path) -> None:
     path.write_text('{"event": "ok"}\ncassé {\n', encoding="utf-8")
     summary = _summary(path)
     assert summary["files"] == [
-        {"name": "logs.jsonl", "format": "jsonl", "records": 2, "unreadable": 1}
+        {
+            "name": "logs.jsonl",
+            "format": "jsonl",
+            "records": 2,
+            "unreadable": 1,
+            "ignored": 0,
+            "invalid_json": False,
+            "too_long": 0,
+        }
     ]
     assert summary["warnings"][0]["code"] == "unreadable"
+
+
+def test_invalid_json_file_is_reported(tmp_path: Path) -> None:
+    path = tmp_path / "export.json"
+    path.write_text('{\n  "email": "cassé\n', encoding="utf-8")
+    summary = _summary(path)
+    assert summary["files"][0]["format"] == "text"
+    assert summary["files"][0]["invalid_json"] is True
+    assert [w["code"] for w in summary["warnings"]] == ["invalid_json"]
+
+
+def test_personal_data_in_event_names_is_reported(tmp_path: Path, pii: dict[str, str]) -> None:
+    span = otlp.span("chat", {}, events=[(f"rappel de {pii['email']}", {})])
+    log = otlp.logs([("ok", {})])
+    log["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["eventName"] = pii["phone"]
+    path = otlp.write_jsonl(tmp_path / "export.jsonl", [otlp.traces([span]), log])
+    summary = _summary(path)
+    found = {(row["source"], row["key"]): row["findings"] for row in summary["locations"]}
+    assert found[("event", "event.name")] == {"EMAIL": 1}
+    assert found[("log", "event.name")] == {"FR_PHONE": 1}
+    assert leaked(json.dumps(summary, ensure_ascii=False), pii.values()) == []
+
+
+def test_file_names_are_redacted(tmp_path: Path, pii: dict[str, str]) -> None:
+    path = tmp_path / f"export-{pii['email']} (copie).jsonl"
+    path.write_text('{"event": "ok"}\n', encoding="utf-8")
+    audit = Auditor(policy_source=f"{pii['email']}.toml")
+    audit.add_file(path)
+    summary = audit.summary()
+    assert summary["schema_version"] == auditor.SCHEMA_VERSION == 1
+    assert summary["files"][0]["name"] == "[EMAIL] (copie).jsonl"
+    assert summary["policy"]["file"].startswith("[EMAIL]")
+    for output in (json.dumps(summary, ensure_ascii=False), render_html(summary)):
+        assert leaked(output, [pii["email"]]) == []
 
 
 def _keep() -> Any:
@@ -230,6 +287,31 @@ def test_examples_stop_at_the_limit() -> None:
     assert audit.summary()["examples"] == {"EMAIL": ["mail [EMAIL] ok"]}
 
 
+def test_proposed_policy_escapes_and_skips_unwritable_keys(tmp_path: Path) -> None:
+    text = propose_policy(
+        "standard",
+        mask=["app.del\x7fkey", "app.both", "app.lone\ud800"],
+        hash_=["app.both", "user.mail"],
+        records=3,
+        generated="2026-10-18",
+    )
+    assert "\x7f" not in text  # TOML forbids DEL in strings: escaped
+    assert "1 key(s) hold invalid Unicode" in text
+    assert tomllib.loads(text)["keys"] == {
+        "mask": ["app.both", "app.del\x7fkey"],
+        "hash": ["user.mail"],  # app.both is masked: mask wins over hash
+    }
+    path = tmp_path / "proposed.toml"
+    path.write_text(text, encoding="utf-8")
+    assert Policy.load(path).key_decision("app.del\x7fkey") == "mask"
+
+    only_invalid = propose_policy(
+        "standard", mask=["\udfff"], hash_=[], records=1, generated="2026-10-18"
+    )
+    assert "No key rule needed" not in only_invalid
+    assert "keys" not in tomllib.loads(only_invalid)
+
+
 def test_proposed_policy_with_mask_rules_only() -> None:
     text = propose_policy(
         "strict", mask=["app.b", "app.a", "app.a"], hash_=[], records=3, generated="2026-10-18"
@@ -237,3 +319,15 @@ def test_proposed_policy_with_mask_rules_only() -> None:
     assert "hash =" not in text
     parsed = tomllib.loads(text)
     assert parsed == {"version": 1, "preset": "strict", "keys": {"mask": ["app.a", "app.b"]}}
+
+
+def test_lines_too_long_to_read_are_reported(
+    tmp_path: Path, pii: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(readers, "_MAX_LINE", 50)
+    path = tmp_path / "app.log"
+    path.write_text(f"contact {pii['email']}\n{'x' * 200}\nfin\n", encoding="utf-8")
+    summary = _summary(path)
+    assert summary["records"]["total"] == 2  # the long line is skipped, never held whole
+    assert summary["files"][0]["too_long"] == 1
+    assert summary["skipped"]["too_large"] == 1

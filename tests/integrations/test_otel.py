@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
@@ -14,9 +16,17 @@ from opentelemetry.sdk.trace.export import (
     SpanExportResult,
 )
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import Link, SpanContext, Status, StatusCode, TraceFlags
+from opentelemetry.trace import (
+    Link,
+    NonRecordingSpan,
+    SpanContext,
+    Status,
+    StatusCode,
+    TraceFlags,
+    TraceState,
+)
 
-from caviard import OnError, Policy
+from caviard import CaviardWarning, OnError, Policy
 from caviard.otel import QUARANTINE_FLAG, QUARANTINED, RedactingSpanExporter
 from helpers import TEST_KEY, exploding_redactor, leaked, make_redactor
 
@@ -222,7 +232,7 @@ def test_batch_processor_flush_and_shutdown(pii: dict[str, str]) -> None:
 def test_resource_cache_is_bounded(pii: dict[str, str], monkeypatch: pytest.MonkeyPatch) -> None:
     import caviard.otel
 
-    monkeypatch.setattr(caviard.otel, "_RESOURCE_CACHE", 1)
+    monkeypatch.setattr(caviard.otel, "_SHARED_CACHE", 1)
     inner = InMemorySpanExporter()
     exporter = RedactingSpanExporter(inner, redactor=make_redactor())
     for owner in ("a@exemple.fr", "b@exemple.fr"):
@@ -236,3 +246,84 @@ def test_resource_cache_is_bounded(pii: dict[str, str], monkeypatch: pytest.Monk
         leaked(encode_spans([first, second]).SerializeToString(), ["a@exemple.fr", "b@exemple.fr"])
         == []
     )
+
+
+def test_event_names_are_redacted(pii: dict[str, str]) -> None:
+    inner = InMemorySpanExporter()
+    provider, _ = _pipeline(RedactingSpanExporter(inner, redactor=make_redactor()))
+    with provider.get_tracer("tests").start_as_current_span("notify") as span:
+        span.add_event(f"mail sent to {pii['email']}")
+    (exported,) = inner.get_finished_spans()
+    assert exported.events[0].name.startswith("mail sent to [EMAIL:")
+    assert leaked(encode_spans([exported]).SerializeToString(), pii.values()) == []
+
+
+def test_configuration_warnings_point_at_the_caller() -> None:
+    policy = Policy.default().replace(plugins=False, key_env=None)
+    with pytest.warns(CaviardWarning, match="pseudonym key") as caught:
+        RedactingSpanExporter(InMemorySpanExporter(), policy)
+    assert Path(caught[0].filename).name == "test_otel.py"
+
+
+def test_scope_attributes_are_redacted(pii: dict[str, str]) -> None:
+    inner = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(
+        SimpleSpanProcessor(RedactingSpanExporter(inner, redactor=make_redactor()))
+    )
+    tracer = provider.get_tracer("genai", "1.0", attributes={"scope.owner": pii["email"]})
+    with tracer.start_as_current_span("step"):
+        pass
+    (span,) = inner.get_finished_spans()
+    assert span.instrumentation_scope is not None
+    assert span.instrumentation_scope.name == "genai"
+    assert span.instrumentation_scope.version == "1.0"
+    assert leaked(encode_spans([span]).SerializeToString(), pii.values()) == []
+
+
+def _stateful(pii: dict[str, str]) -> SpanContext:
+    """A remote parent whose trace state, set by the caller's tracestate header, holds
+    an e-mail address."""
+    state = TraceState([("vendor", "ok123"), ("acme", f"user/{pii['email']}")])
+    return SpanContext(
+        trace_id=_REMOTE.trace_id,
+        span_id=_REMOTE.span_id,
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+        trace_state=state,
+    )
+
+
+def _span_in(provider: TracerProvider, parent: SpanContext) -> None:
+    context = trace.set_span_in_context(NonRecordingSpan(parent))
+    tracer = provider.get_tracer("tests")
+    with tracer.start_as_current_span("chat", context=context, links=[Link(parent)]):
+        pass
+
+
+def test_trace_state_values_are_redacted(pii: dict[str, str]) -> None:
+    inner = InMemorySpanExporter()
+    provider, raw = _pipeline(RedactingSpanExporter(inner, redactor=make_redactor()))
+    _span_in(provider, _stateful(pii))
+
+    (span,) = inner.get_finished_spans()
+    for context in (span.context, span.parent, span.links[0].context):
+        assert context is not None
+        assert context.trace_state["vendor"] == "ok123"
+        assert context.trace_state["acme"].startswith("user/[EMAIL:")
+    assert leaked(encode_spans([span]).SerializeToString(), pii.values()) == []
+    raw_wire = encode_spans(raw.get_finished_spans()).SerializeToString()
+    assert pii["email"].encode() in raw_wire  # the data was there
+
+
+def test_quarantine_drops_the_trace_state(pii: dict[str, str]) -> None:
+    inner = InMemorySpanExporter()
+    provider, _ = _pipeline(RedactingSpanExporter(inner, redactor=exploding_redactor()))
+    _span_in(provider, _stateful(pii))
+
+    (span,) = inner.get_finished_spans()
+    for context in (span.context, span.parent, span.links[0].context):
+        assert context is not None
+        assert not context.trace_state
+    assert span.context is not None
+    assert span.context.trace_id == _REMOTE.trace_id  # the trace stays linked

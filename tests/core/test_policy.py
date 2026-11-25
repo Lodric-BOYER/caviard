@@ -164,3 +164,121 @@ def test_replace_recompiles_key_rules() -> None:
     policy = Policy.default().replace(allow_keys=("only.this",))
     assert policy.key_decision("only.this") == "allow"
     assert policy.key_decision("gen_ai.usage.input_tokens") is None
+
+
+def test_allowed_otel_keys_are_explicit() -> None:
+    # Instrumentations may copy the status description, an error message, into an attribute.
+    policy = Policy.default()
+    assert policy.key_decision("otel.scope.name") == "allow"
+    assert policy.key_decision("otel.status_code") == "allow"
+    assert policy.key_decision("otel.status_description") != "allow"
+    # On server spans, the client sets server.address (the Host header): it is analysed.
+    assert policy.key_decision("server.address") is None
+    assert policy.key_decision("server.port") == "allow"
+    assert policy.key_decision("client.address") != "allow"  # the end user's address
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "db_password",
+        "client_secret",
+        "x-api-key",
+        "auth_token",
+        "session_token",
+        "secret_key",
+        "AWS_SECRET_ACCESS_KEY",
+        "privateKey",
+        "Set-Cookie",
+        "credentials",
+        "proxy_authorization",
+        "passphrase",
+        "cvv",
+        "mot_de_passe_admin",
+    ],
+)
+def test_compound_secret_names_are_sensitive(name: str) -> None:
+    assert Policy.default().is_sensitive_field(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "billing_address",
+        "shipping_address",
+        "contact_email",
+        "mobile_phone",
+        "date_of_birth",
+        "birthday",
+        "patient_name",
+        "client_name",
+        "github_username",
+        "customer_iban",
+        "Prénom",
+        "nom_de_famille",
+        "tel_client",
+        "mobile_number",
+        "whatsapp",
+    ],
+)
+def test_compound_personal_names_are_sensitive(name: str) -> None:
+    assert Policy.default().is_sensitive_field(name)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "input_tokens",
+        "max_tokens",
+        "token_count",
+        "tokenizer",
+        "token_type",
+        "model",
+        "model_name",
+        "tool_name",
+        "function_name",
+        "display_name",
+        "finish_reason",
+    ],
+)
+def test_model_and_tool_names_and_token_counts_stay_readable(name: str) -> None:
+    assert not Policy.default().is_sensitive_field(name)
+
+
+def test_sensitive_field_patterns_in_a_policy() -> None:
+    policy = Policy.from_dict({"json": {"sensitive_fields": ["*_dossier", "Numéro-*"]}})
+    assert policy.is_sensitive_field("patient_dossier")
+    assert policy.is_sensitive_field("numero_client")
+    assert not policy.is_sensitive_field("dossier_id")
+    assert not policy.is_sensitive_field("x" * 300 + "password")  # not a field name
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "http.request.header.authorization",
+        "http.request.header.proxy_authorization",
+        "http.request.header.x-api-key",
+        "http.request.header.x_api_key",
+        "http.request.header.api-key",
+        "http.request.header.x_auth_token",
+        "http.request.header.cookie",
+        "http.response.header.set-cookie",
+        "http.response.header.set_cookie",
+        "http.request.header.ocp-apim-subscription-key",
+    ],
+)
+def test_secret_headers_are_masked_in_both_spellings(key: str) -> None:
+    assert Policy.default().key_decision(key) == "mask"
+
+
+def test_other_headers_are_analysed() -> None:
+    assert Policy.default().key_decision("http.request.header.content_type") is None
+    assert Policy.default().key_decision("http.response.header.content-length") is None
+
+
+def test_long_keys_are_not_cached() -> None:
+    policy = Policy.default()
+    key = "app." + "x" * 5_000
+    assert policy.key_decision(key) is None
+    assert key not in policy._decisions

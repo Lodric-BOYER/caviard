@@ -73,6 +73,14 @@ def normalize_field(name: str) -> str:
     return "".join(char for char in decomposed if char.isascii() and char.isalnum())
 
 
+def _normalize_pattern(name: str) -> str:
+    """``normalize_field`` for a field name that may hold ``*`` and ``?`` wildcards."""
+    if "*" not in name and "?" not in name:
+        return normalize_field(name)
+    parts = re.split(r"([*?])", name)
+    return "".join(part if part in ("*", "?") else normalize_field(part) for part in parts)
+
+
 # Attribute keys that never carry user content: exported unchanged.
 DEFAULT_ALLOW_KEYS: tuple[str, ...] = (
     "gen_ai.operation.name",
@@ -106,9 +114,14 @@ DEFAULT_ALLOW_KEYS: tuple[str, ...] = (
     "openinference.span.kind",
     "service.*",
     "telemetry.*",
-    "otel.*",
+    "otel.scope.name",
+    "otel.scope.version",
+    "otel.library.name",
+    "otel.library.version",
+    "otel.status_code",
     "http.request.method",
     "http.response.status_code",
+    "server.port",
     "error.type",
     "langfuse.observation.type",
     "langfuse.observation.level",
@@ -119,65 +132,99 @@ DEFAULT_ALLOW_KEYS: tuple[str, ...] = (
     "langfuse.release",
     "langfuse.version",
 )
-# Attribute keys whose whole value is replaced, without analysis.
+# Attribute keys whose whole value is replaced, without analysis. Captured HTTP headers
+# are spelt with hyphens or underscores, depending on the instrumentation.
 DEFAULT_MASK_KEYS: tuple[str, ...] = (
     "user.email",
     "user.full_name",
     "user.name",
-    "http.request.header.authorization",
-    "http.request.header.cookie",
-    "http.request.header.proxy-authorization",
-    "http.request.header.x-api-key",
-    "http.response.header.set-cookie",
+    "http.*.header.*authorization*",
+    "http.*.header.*cookie*",
+    "http.*.header.*token*",
+    "http.*.header.*api?key*",
+    "http.*.header.*apikey*",
+    "http.*.header.*secret*",
+    "http.*.header.*password*",
+    "http.*.header.*session*",
+    "http.*.header.*subscription?key*",
 )
 # Attribute keys whose whole value is pseudonymised (correlation is kept).
 DEFAULT_HASH_KEYS: tuple[str, ...] = ("enduser.id", "user.id")
-# JSON fields (and last segments of attribute keys) whose value is replaced.
+# JSON fields (and last segments of attribute keys) whose value is replaced. Patterns
+# catch compound names (billing_address, contact_email, db_password, x-api-key);
+# "*token" is a suffix only, so that token counts (input_tokens) stay readable, and no
+# pattern holds "name" alone, so that model and tool names do too.
 DEFAULT_SENSITIVE_FIELDS: tuple[str, ...] = (
-    "email",
-    "email_address",
+    # Personal data
+    "*email*",
     "mail",
-    "courriel",
-    "phone",
-    "phone_number",
-    "telephone",
-    "tel",
-    "mobile",
-    "portable",
-    "address",
-    "street_address",
-    "postal_address",
-    "adresse",
-    "first_name",
-    "last_name",
-    "full_name",
-    "customer_name",
-    "username",
-    "prenom",
+    "*courriel*",
+    "*phone*",
+    "tel*",
+    "mobile*",
+    "*portable*",
+    "*whatsapp*",
+    "*address*",
+    "*adresse*",
+    "*street*",
+    "*first_name*",
+    "*last_name*",
+    "*full_name*",
+    "*surname*",
+    "*given_name*",
+    "*family_name*",
+    "*middle_name*",
+    "*maiden_name*",
+    "*user_name*",
+    "*customer_name*",
+    "*client_name*",
+    "*contact_name*",
+    "*patient_name*",
+    "*prenom*",
     "nom",
-    "nom_complet",
-    "birth_date",
-    "date_of_birth",
+    "*nom_complet*",
+    "*nom_de_famille*",
+    "*birth*",
     "dob",
-    "date_naissance",
-    "date_de_naissance",
-    "iban",
+    "*naissance*",
+    "*iban*",
     "nir",
     "ssn",
-    "social_security_number",
-    "numero_secu",
-    "password",
-    "passwd",
-    "mot_de_passe",
+    "*social_security*",
+    "*numero_secu*",
+    "card_number",
+    "cvv",
+    "cvv2",
+    "cvc",
+    "security_code",
+    # Secrets
+    "pin",
+    "pin_code",
+    "otp",
     "mdp",
-    "secret",
-    "token",
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "api_key",
-    "authorization",
+    "*password*",
+    "*passwd*",
+    "*pwd",
+    "*mot_de_passe*",
+    "*passphrase*",
+    "*passcode*",
+    "*secret*",
+    "*token",
+    "*token_value*",
+    "refresh",
+    "*session_id*",
+    "*sessid*",
+    "sid",
+    "*csrf*",
+    "*api_key*",
+    "*private_key*",
+    "*access_key*",
+    "*credential*",
+    "*authorization*",
+    "*cookie*",
 )
+_MAX_FIELD_NAME = 256  # longer texts are not field names (and are not cached)
+_MAX_CACHED_KEY = 1_024  # longer attribute keys are matched without being cached
 
 
 def _preset_standard() -> dict[str, Any]:
@@ -279,6 +326,7 @@ class Policy:
     plugins: bool = True
     _matchers: tuple[tuple[KeyDecision, re.Pattern[str]], ...] = field(init=False, repr=False)
     _decisions: dict[str, KeyDecision | None] = field(init=False, repr=False)
+    _field_patterns: re.Pattern[str] | None = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         groups: tuple[tuple[KeyDecision, tuple[str, ...]], ...] = (
@@ -292,11 +340,10 @@ class Policy:
         )
         object.__setattr__(self, "_matchers", matchers)
         object.__setattr__(self, "_decisions", {})
-        object.__setattr__(
-            self,
-            "sensitive_fields",
-            frozenset(normalize_field(name) for name in self.sensitive_fields),
-        )
+        fields = frozenset(_normalize_pattern(name) for name in self.sensitive_fields)
+        object.__setattr__(self, "sensitive_fields", fields)
+        patterns = sorted(name for name in fields if "*" in name or "?" in name)
+        object.__setattr__(self, "_field_patterns", _compile_globs(patterns) if patterns else None)
 
     # Construction
 
@@ -364,13 +411,24 @@ class Policy:
         except KeyError:
             pass
         decision = next((name for name, regex in self._matchers if regex.match(key)), None)
-        if len(self._decisions) >= 4096:
-            self._decisions.clear()
-        self._decisions[key] = decision
+        if len(key) <= _MAX_CACHED_KEY:
+            if len(self._decisions) >= 4096:
+                self._decisions.clear()
+            self._decisions[key] = decision
         return decision
 
     def is_sensitive_field(self, name: str) -> bool:
-        return bool(self.sensitive_fields) and normalize_field(name) in self.sensitive_fields
+        """Whether values under this field name are replaced whole.
+
+        Case, accents and separators are ignored; ``json.sensitive_fields`` entries
+        may hold ``*`` and ``?`` wildcards ("*password*").
+        """
+        if not self.sensitive_fields or len(name) > _MAX_FIELD_NAME:
+            return False
+        normal = normalize_field(name)
+        if normal in self.sensitive_fields:
+            return True
+        return self._field_patterns is not None and self._field_patterns.match(normal) is not None
 
     @classmethod
     def _build(cls, preset: str, data: Mapping[str, Any]) -> Policy:

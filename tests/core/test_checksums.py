@@ -83,7 +83,8 @@ def test_iban_rules() -> None:
     assert not iban_ok("FR763000600001123456789018")  # wrong length for France
     assert not iban_ok("FR7630006000011234567890188")  # wrong check digits
     assert not iban_ok("7630006000011234567890189FR")
-    assert not iban_ok("FR76-3000-6000-0112-3456-7890-189")
+    assert iban_ok("FR76-3000-6000-0112-3456-7890-189")  # hyphens, as some forms print it
+    assert not iban_ok("FR76.3000.6000.0112.3456.7890.189")
 
 
 def test_only_ascii_digits_are_accepted() -> None:

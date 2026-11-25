@@ -22,7 +22,7 @@ __all__ = [
 
 _NON_DIGIT = re.compile(r"[^0-9]")
 _NIR_SEPARATORS = re.compile(r"[ \u00a0\u202f.\-]")
-_IBAN_SEPARATORS = re.compile(r"[ \u00a0\u202f]")
+_IBAN_SEPARATORS = re.compile(r"[ \u00a0\u202f\-]")
 
 # Registered IBAN lengths (ISO 13616) for European countries. Countries absent
 # from the table only need a length between 15 and 34 characters.

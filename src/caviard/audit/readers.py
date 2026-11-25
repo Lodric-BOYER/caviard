@@ -27,7 +27,11 @@ from caviard.core.errors import CaviardError
 __all__ = ["FORMATS", "Field", "FileStats", "Record", "read"]
 
 FORMATS = ("auto", "otlp", "jsonl", "text")
-_MAX_DOCUMENT = 256 * 1024 * 1024  # characters read at once for a single JSON document
+_MEGABYTE = 1024 * 1024
+# Memory bounds: a JSON document is read and parsed at once (several times its size in
+# memory), lines are read one at a time. Longer lines are skipped, counted, never held.
+_MAX_DOCUMENT = 64 * _MEGABYTE  # characters of a single JSON document
+_MAX_LINE = 16 * _MEGABYTE  # characters of one line of JSON Lines or text
 _SPAN_SCOPES = ("scopeSpans", "instrumentationLibrarySpans")  # current and legacy names
 _LOG_SCOPES = ("scopeLogs", "instrumentationLibraryLogs")
 
@@ -63,6 +67,9 @@ class FileStats:
     format: str = ""
     records: int = 0
     unreadable: int = 0  # lines that were not valid JSON in a JSON file
+    ignored: int = 0  # JSON values that are not OTLP requests, with the otlp format
+    invalid_json: bool = False  # looked like one JSON document, was read as text
+    too_long: int = 0  # lines longer than the line size cap: skipped, not analysed
 
 
 def read(path: Path, fmt: str = "auto", stats: FileStats | None = None) -> Iterator[Record]:
@@ -74,7 +81,7 @@ def read(path: Path, fmt: str = "auto", stats: FileStats | None = None) -> Itera
         with _open(path) as handle:
             yield from _read(handle, fmt, stats)
     except (OSError, EOFError, zlib.error):
-        raise CaviardError(f"cannot read {path.name!r}") from None
+        raise CaviardError(f"cannot read {stats.name!r}") from None
 
 
 def _open(path: Path) -> IO[str]:
@@ -86,13 +93,18 @@ def _open(path: Path) -> IO[str]:
 def _read(handle: IO[str], fmt: str, stats: FileStats) -> Iterator[Record]:
     if fmt == "text":
         stats.format = "text"
-        yield from _counted(_text_records(handle), stats)
+        yield from _counted(_text_records(handle, stats), stats)
         return
-    first = handle.readline()
-    while first and not first.strip():
-        first = handle.readline()
+    first = _first_line(handle)
     if not first:
         stats.format = fmt if fmt != "auto" else "empty"
+        return
+    if len(first) > _MAX_DOCUMENT:  # no line end within the document size cap
+        if fmt != "auto" or first.lstrip()[:1] in ("{", "["):
+            raise _too_large(stats)
+        stats.format = "text"
+        handle.seek(0)
+        yield from _counted(_text_records(handle, stats), stats)
         return
     try:
         parsed: Any = json.loads(first)
@@ -101,20 +113,29 @@ def _read(handle: IO[str], fmt: str, stats: FileStats) -> Iterator[Record]:
     if isinstance(parsed, dict | list):
         stats.format = "jsonl"
         yield from _counted(_json_lines(parsed, handle, fmt, stats), stats)
+        _check_otlp(fmt, stats)
         return
     if first.lstrip()[:1] in ("{", "["):
-        document = _document(first, handle)
+        document = _document(first, handle, stats)
         if document is not None:
             stats.format = "json"
             yield from _counted(_objects(document, fmt, stats), stats)
+            _check_otlp(fmt, stats)
             return
         if fmt != "auto":
             raise CaviardError(f"{stats.name!r} is not valid JSON")
+        stats.invalid_json = True
     elif fmt != "auto":
         raise CaviardError(f"{stats.name!r} is not a JSON file (use --format text)")
     stats.format = "text"
     handle.seek(0)
-    yield from _counted(_text_records(handle), stats)
+    yield from _counted(_text_records(handle, stats), stats)
+
+
+def _check_otlp(fmt: str, stats: FileStats) -> None:
+    # Read as OTLP on request, a file of other JSON values would look clean.
+    if fmt == "otlp" and stats.format != "otlp" and stats.ignored:
+        raise CaviardError(f"{stats.name!r} holds no OTLP request (use --format jsonl)")
 
 
 def _counted(records: Iterable[Record], stats: FileStats) -> Iterator[Record]:
@@ -124,19 +145,49 @@ def _counted(records: Iterable[Record], stats: FileStats) -> Iterator[Record]:
         yield record
 
 
-def _document(first: str, handle: IO[str]) -> Any:
-    rest = handle.read(_MAX_DOCUMENT)
+def _first_line(handle: IO[str]) -> str:
+    """The first line that is not blank, read up to the document size cap (minified JSON)."""
+    while True:
+        line = handle.readline(_MAX_DOCUMENT + 1)
+        if not line or line.strip():
+            return line
+
+
+def _lines(handle: IO[str], stats: FileStats) -> Iterator[str]:
+    """The next lines; one longer than the line size cap is skipped piece by piece."""
+    while line := handle.readline(_MAX_LINE + 1):
+        if len(line) <= _MAX_LINE or line.endswith("\n"):
+            yield line
+            continue
+        stats.too_long += 1
+        while (rest := handle.readline(_MAX_LINE)) and not rest.endswith("\n"):
+            pass
+
+
+def _document(first: str, handle: IO[str], stats: FileStats) -> Any:
+    rest = handle.read(_MAX_DOCUMENT - len(first))
     if handle.read(1):
-        raise CaviardError("JSON document too large: export it as JSON Lines instead")
+        raise _too_large(stats)
     try:
         return json.loads(first + rest)
     except (ValueError, RecursionError):
         return None
 
 
+def _too_large(stats: FileStats) -> CaviardError:
+    if _MAX_DOCUMENT >= _MEGABYTE:
+        limit = f"{_MAX_DOCUMENT // _MEGABYTE} MB"
+    else:
+        limit = f"{_MAX_DOCUMENT} characters"
+    return CaviardError(
+        f"{stats.name!r} holds a JSON document too large to read at once (over {limit}): "
+        "export it as JSON Lines instead"
+    )
+
+
 def _json_lines(parsed: Any, handle: IO[str], fmt: str, stats: FileStats) -> Iterator[Record]:
     yield from _objects(parsed, fmt, stats)
-    for line in handle:
+    for line in _lines(handle, stats):
         if not line.strip():
             continue
         try:
@@ -159,7 +210,7 @@ def _objects(value: Any, fmt: str, stats: FileStats) -> Iterator[Record]:
         yield from _otlp(value)
         return
     if fmt == "otlp":
-        stats.unreadable += 1
+        stats.ignored += 1
         return
     if isinstance(value, Mapping):
         yield _generic(value)
@@ -173,8 +224,8 @@ def _generic(value: Mapping[str, Any]) -> Record:
     return Record("record", service=service if isinstance(service, str) else "", fields=fields)
 
 
-def _text_records(handle: IO[str]) -> Iterator[Record]:
-    for line in handle:
+def _text_records(handle: IO[str], stats: FileStats) -> Iterator[Record]:
+    for line in _lines(handle, stats):
         if line.strip():
             yield _text(line)
 
@@ -199,6 +250,9 @@ def _otlp(request: Mapping[str, Any]) -> Iterator[Record]:
             yield resource
         for scope_name, log in _scoped(group, _LOG_SCOPES, "logRecords"):
             fields = [Field("log", "body", _value(log.get("body")), attribute=False)]
+            event_name = log.get("eventName")
+            if isinstance(event_name, str) and event_name:
+                fields.append(Field("log", "event.name", event_name, attribute=False))
             fields += [Field("log", key, value) for key, value in _attributes(log)]
             yield Record("log", service, scope_name, fields)
 
@@ -227,6 +281,8 @@ def _span_fields(span: Mapping[str, Any]) -> list[Field]:
     for event in _list(span.get("events")):
         name = event.get("name", "")
         detail = name if isinstance(name, str) else ""
+        if detail:  # names can hold personal data too ("lookup jean@...")
+            fields.append(Field("event", "event.name", detail, attribute=False))
         fields += [Field("event", key, value, detail) for key, value in _attributes(event)]
     for link in _list(span.get("links")):
         fields += [Field("link", key, value) for key, value in _attributes(link)]
