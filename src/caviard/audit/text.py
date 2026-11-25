@@ -2,13 +2,39 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from caviard.audit.auditor import KIND_LABELS
 
-__all__ = ["render_text"]
+__all__ = ["printable", "printable_json", "render_text"]
 
 _TOP = 15
+# Control characters (terminal escape sequences start with one) and the invisible or
+# bidirectional characters that can disguise a name.
+_UNSAFE = re.compile(
+    r"[\x00-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+
+
+# What json.dumps(ensure_ascii=False) leaves as is among them.
+_UNSAFE_IN_JSON = re.compile(
+    r"[\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]"
+)
+
+
+def printable(text: str) -> str:
+    """Text taken from the data, safe to print: unsafe characters become \\uXXXX escapes."""
+    return _UNSAFE.sub(_escape, text)
+
+
+def printable_json(document: str) -> str:
+    """JSON text safe to print; the escapes keep it valid JSON with the same content."""
+    return _UNSAFE_IN_JSON.sub(_escape, document)
+
+
+def _escape(match: re.Match[str]) -> str:
+    return f"\\u{ord(match.group()):04x}"
 
 
 def render_text(summary: dict[str, Any]) -> str:
@@ -36,7 +62,7 @@ def render_text(summary: dict[str, Any]) -> str:
     if locations:
         lines += ["", f"  {'where':<52}{'values':>13}  {'rule':<6} suggestion"]
         for row in locations[:_TOP]:
-            where = (
+            where = printable(
                 row["key"]
                 + f" [{row['source']}"
                 + (f" {row['detail']}" if row["detail"] else "")
@@ -52,7 +78,7 @@ def render_text(summary: dict[str, Any]) -> str:
             lines.append(f"  ... {more:,} more location(s) in the HTML or JSON report")
     if summary["warnings"]:
         lines += ["", "Warnings:"]
-        lines += [f"  - {warning['message']}" for warning in summary["warnings"]]
+        lines += [f"  - {printable(warning['message'])}" for warning in summary["warnings"]]
     return "\n".join(lines)
 
 

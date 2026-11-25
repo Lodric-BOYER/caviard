@@ -59,7 +59,10 @@ def mask_otel_spans(
                 patch = _patch(engine, attributes)
             except Exception:
                 engine.stats.add(E.QUARANTINED)
-                patch = _quarantine(engine, attributes)
+                try:
+                    patch = _quarantine(engine, attributes)
+                except Exception:  # never raise: Langfuse would drop the whole batch
+                    patch = _deletion(engine, attributes)
             if patch is not None:
                 changed, deleted = patch
                 patches[identifier] = OtelSpanPatch(
@@ -91,6 +94,11 @@ def _quarantine(engine: Redactor, attributes: Mapping[str, Any]) -> Patch:
     return {**changed, **flag}, ()
 
 
+def _deletion(engine: Redactor, attributes: Mapping[str, Any]) -> Patch:
+    unsafe = tuple(key for key in attributes if engine.policy.key_decision(key) != "allow")
+    return {QUARANTINE_FLAG: True}, unsafe
+
+
 def _encode(key: str, new: Any, old: Any) -> Any:
     if not (key.startswith(_JSON_PREFIX) and isinstance(new, str) and isinstance(old, str)):
         return new
@@ -104,4 +112,6 @@ def _is_json(text: str) -> bool:
         json.loads(text)
     except ValueError:
         return False
+    except RecursionError:  # JSON nested too deep for this interpreter: JSON all the same
+        return True
     return True

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
+import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -132,6 +135,128 @@ def test_audit_json_check_and_inputs(
     assert len(json.loads(capsys.readouterr().out)["files"]) == 1
 
 
+def test_audit_reads_directories_recursively(
+    tmp_path: Path, pii: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    export = _export(tmp_path, pii)
+    nested = tmp_path / "2026" / "10"
+    nested.mkdir(parents=True)
+    (nested / "app.log").write_text(f"contact {pii['email']}\n", encoding="utf-8")
+    (tmp_path / ".hidden.log").write_text(f"{pii['iban']}\n", encoding="utf-8")
+    (tmp_path / ".cache").mkdir()
+    (tmp_path / ".cache" / "old.log").write_text(f"{pii['iban']}\n", encoding="utf-8")
+
+    def formats(*paths: Path) -> list[str]:
+        assert main(["audit", "--json", *map(str, paths)]) == 0
+        return sorted(f["format"] for f in json.loads(capsys.readouterr().out)["files"])
+
+    assert formats(tmp_path) == ["otlp", "text"]  # hidden files and directories skipped
+    assert formats(tmp_path / "**" / "*.log") == ["text"]
+    assert formats(tmp_path / "20*") == ["text"]  # a matched directory is read too
+    assert formats(export, tmp_path / "*.jsonl", tmp_path) == ["otlp", "text"]  # read once
+
+
+def test_audit_never_overwrites_its_inputs(
+    tmp_path: Path, pii: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    export = _export(tmp_path, pii)
+    policy = tmp_path / "caviard.toml"
+    policy.write_text('version = 1\npreset = "standard"\n', encoding="utf-8")
+    before = export.read_bytes(), policy.read_bytes()
+
+    assert main(["audit", str(export), "-o", str(export)]) == 2
+    assert "-o: 'export.jsonl' is an input of this audit" in capsys.readouterr().err
+    for extra in (["--policy-out", str(policy)], ["--policy-out", str(policy), "--force"]):
+        assert main(["audit", str(export), "-p", str(policy), *extra]) == 2
+        assert "is an input of this audit" in capsys.readouterr().err
+    same = str(tmp_path / "out.txt")
+    assert main(["audit", str(export), "-o", same, "--policy-out", same]) == 2
+    assert "name the same file" in capsys.readouterr().err
+    assert (export.read_bytes(), policy.read_bytes()) == before
+
+
+def test_audit_policy_out_needs_force_to_replace(
+    tmp_path: Path, pii: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    export = _export(tmp_path, pii)
+    proposed = tmp_path / "proposed.toml"
+    proposed.write_text("# my rules\n", encoding="utf-8")
+
+    assert main(["audit", str(export), "--policy-out", str(proposed)]) == 2
+    assert "exists" in capsys.readouterr().err
+    assert proposed.read_text(encoding="utf-8") == "# my rules\n"
+    assert main(["audit", str(export), "--policy-out", str(proposed), "--force"]) == 0
+    assert proposed.read_text(encoding="utf-8").startswith("# Policy proposed by caviard")
+
+
+def test_audit_check_fails_on_values_it_could_not_analyse(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    export = tmp_path / "big.jsonl"
+    export.write_text(json.dumps({"note": "a" * 250_000}) + "\n", encoding="utf-8")
+    assert main(["audit", str(export)]) == 0  # without --check, a report only
+    capsys.readouterr()
+    assert main(["audit", "--check", str(export)]) == 1
+    assert "1 value(s) could not be analysed, so --check fails" in capsys.readouterr().err
+    policy = tmp_path / "large.toml"
+    policy.write_text("version = 1\nmax_chars = 1000000\n", encoding="utf-8")
+    assert main(["audit", "--check", "-p", str(policy), str(export)]) == 0
+
+
+def test_audit_json_escapes_terminal_sequences(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    export = tmp_path / "keys.jsonl"
+    export.write_text(json.dumps({"app.\x9b2J\u202ekey": "jean@exemple.fr"}) + "\n", "utf-8")
+    assert main(["audit", "--json", str(export)]) == 0
+    out = capsys.readouterr().out
+    assert "\x9b" not in out
+    assert "\u202e" not in out
+    assert json.loads(out)["locations"][0]["key"] == "app.\x9b2J\u202ekey"
+
+
+def test_audit_forced_otlp_format_on_other_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    logs = otlp.write_jsonl(tmp_path / "app.jsonl", [{"event": "connexion"}])
+    assert main(["audit", "--format", "otlp", str(logs)]) == 2
+    assert "holds no OTLP request (use --format jsonl)" in capsys.readouterr().err
+
+
+def test_warnings_are_printed_as_one_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    policy = tmp_path / "caviard.toml"
+    policy.write_text('version = 1\n[entities]\nFR_PHON = "keep"\n', encoding="utf-8")
+    message = (
+        "no detector reports FR_PHON: these [entities] rules have no "
+        "effect (check the names, or install the plugin that reports them)\n"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("default")
+        for _ in range(2):  # every run shows it, not only the first one in the process
+            assert main(["scan", "-p", str(policy), "rien"]) == 0
+            assert capsys.readouterr().err == f"caviard: warning: {message}"
+        warnings.simplefilter("error")  # python -W error: the warning becomes an error
+        assert main(["scan", "-p", str(policy), "rien"]) == 2
+        assert capsys.readouterr().err == f"caviard: error: {message}"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows pipes report EINVAL, not EPIPE")
+def test_closed_output_pipe_ends_quietly() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-m", "caviard", "scan", TEXT],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    process.stdout.close()  # as `| head` does once it has read enough
+    err = process.stderr.read()
+    assert process.wait(timeout=120) == 141
+    assert err == b""
+
+
 def test_audit_errors(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["audit", str(tmp_path / "absent.jsonl")]) == 2
     assert main(["audit", str(tmp_path / "*.nothing")]) == 2
@@ -225,3 +350,39 @@ def test_bench(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["bench", "--count", "5", "--json"]) == 0
     assert len(json.loads(capsys.readouterr().out)["scenarios"]) == 4
     assert main(["bench", "--count", "0"]) == 2
+
+
+def test_error_messages_redact_file_names(
+    tmp_path: Path, pii: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    missing = tmp_path / f"export-{pii['email']}.jsonl"
+    assert main(["audit", str(missing)]) == 2
+    error = capsys.readouterr().err
+    assert error.startswith("caviard: error: cannot read '")
+    assert "[EMAIL]" in error
+    assert leaked(error, pii.values()) == []
+
+
+def test_reader_errors_redact_file_names(
+    tmp_path: Path, pii: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    broken = tmp_path / f"{pii['email']} export.json"
+    broken.write_text('{"note": ', encoding="utf-8")
+    assert main(["audit", "--format", "jsonl", str(broken)]) == 2
+    error = capsys.readouterr().err
+    assert "is not valid JSON" in error
+    assert "[EMAIL]" in error
+    assert leaked(error, pii.values()) == []
+
+
+def test_a_file_reached_twice_is_read_once(
+    tmp_path: Path, pii: dict[str, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    export = _export(tmp_path, pii)
+    link = tmp_path / "link.jsonl"
+    try:
+        link.symlink_to(export)
+    except OSError:
+        pytest.skip("symbolic links are not available here")
+    assert main(["audit", "--json", str(export), str(link)]) == 0
+    assert len(json.loads(capsys.readouterr().out)["files"]) == 1

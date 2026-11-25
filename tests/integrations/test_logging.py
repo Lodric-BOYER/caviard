@@ -6,9 +6,13 @@ import io
 import logging
 import sys
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 import pytest
+from faker import Faker
 
 from caviard import CaviardError, Policy
 from caviard.integrations.logging import (
@@ -17,7 +21,7 @@ from caviard.integrations.logging import (
     install,
     structlog_processor,
 )
-from helpers import exploding_redactor, leaked, make_redactor
+from helpers import exploding_redactor, leaked, luhn_complete, make_redactor
 
 
 class Keep(logging.Handler):
@@ -64,6 +68,149 @@ def test_message_arguments_and_extra_fields(logger: logging.Logger, pii: dict[st
     assert leaked(output, pii.values()) == []
     assert output.startswith("Client [EMAIL:")
     assert "| IBAN [IBAN] | 1042" in output
+
+
+@dataclass
+class _Contact:
+    full_name: str
+    email: str
+
+
+class _Plan(Enum):
+    PRO = "pro"
+
+
+class _Unprintable:
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    def __str__(self) -> str:
+        raise ValueError(self.secret)
+
+    __repr__ = __str__
+
+
+@pytest.fixture
+def keep(logger: logging.Logger) -> Keep:
+    handler = Keep()
+    handler.addFilter(RedactingFilter(redactor=make_redactor()))
+    logger.addHandler(handler)
+    return handler
+
+
+def test_arguments_keep_their_structure(logger: logging.Logger, keep: Keep, fake: Faker) -> None:
+    names = [fake.first_name(), fake.last_name()]
+    # Printed, this is no literal (the date) and the names follow no pattern: only
+    # the structure tells that the list under "full_name" is personal data.
+    logger.info("profil %s", {"full_name": names, "seen": datetime(2026, 10, 18), "plan": "pro"})
+
+    message = keep.records[0].getMessage()
+    assert leaked(message, names) == []
+    assert message == (
+        "profil {'full_name': '[REDACTED]', "
+        "'seen': 'datetime.datetime(2026, 10, 18, 0, 0)', 'plan': 'pro'}"
+    )
+
+
+def test_named_arguments(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str], fake: Faker
+) -> None:
+    name = fake.name()
+    logger.info("%(customer_name)s au %(tel)s", {"customer_name": name, "tel": pii["phone"]})
+    assert keep.records[0].getMessage() == "[REDACTED] au [REDACTED]"
+
+
+def test_precision_cuts_the_placeholder(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str]
+) -> None:
+    logger.info("contact %.8s", pii["email"])
+    message = keep.records[0].getMessage()
+    assert message.startswith("contact [EMAIL")
+    assert pii["email"][:8] not in message
+
+
+def test_objects_are_printed_redacted(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str], fake: Faker
+) -> None:
+    contact = _Contact(fake.name(), pii["email"])
+    logger.info("%s | %r", contact, contact)
+
+    message = keep.records[0].getMessage()
+    assert leaked(message, [contact.full_name, contact.email]) == []
+    as_str, as_repr = message.split(" | ")
+    assert as_str == as_repr  # "%r" adds no quotes around the redacted text
+    assert as_str.startswith("_Contact(full_name='[REDACTED]', email=")
+
+
+def test_placeholders_that_break_the_format(logger: logging.Logger, keep: Keep) -> None:
+    card = luhn_complete("497010000000000")
+    logger.info("carte %d", int(card))  # "%d" cannot print "[CARD]": the merged text is redacted
+    message = keep.records[0].getMessage()
+    assert message.startswith("carte [CARD")
+    assert card not in message
+
+
+def test_values_split_across_arguments(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str]
+) -> None:
+    local, domain = pii["email"].split("@")
+    logger.info("%s@%s", local, domain)
+    message = keep.records[0].getMessage()
+    assert message.startswith("[EMAIL")
+    assert leaked(message, [pii["email"]]) == []
+
+
+def test_large_arguments_are_redacted_as_text(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str]
+) -> None:
+    logger.info("lot %s", [{"tel": pii["phone"], "mail": pii["email"]}] * 12_000)
+    assert leaked(keep.records[0].getMessage(), pii.values()) == []
+
+
+def test_arguments_of_every_container_kind(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str]
+) -> None:
+    deep: list[object] = []
+    node = deep
+    for _ in range(70):  # deeper than the walk goes: printed, then redacted as text
+        child: list[object] = []
+        node.append(child)
+        node = child
+    node.append(pii["email"])
+    logger.info(
+        "%s | %s | %s | %s",
+        {pii["email"]},
+        frozenset({("tel", pii["phone"])}),
+        {_Plan.PRO: pii["iban"], ("k", 1): "ok"},
+        deep,
+        extra={"rows": [pii["nir"]] * 12_000},  # too many items: redacted as text
+    )
+    (record,) = keep.records
+    assert leaked(record.getMessage(), pii.values()) == []
+    assert leaked(str(record.rows), pii.values()) == []
+
+
+def test_unprintable_argument_quarantines_the_record(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str]
+) -> None:
+    logger.info("objet %s", _Unprintable(pii["email"]))
+    assert keep.records[0].getMessage() == QUARANTINED
+
+
+def test_extra_objects_are_redacted_as_text(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str], fake: Faker
+) -> None:
+    contact = _Contact(fake.name(), pii["email"])
+    logger.info(
+        "rendez-vous",
+        extra={"plan": _Plan.PRO, "contact": contact, "rows": [{"email": pii["email"]}]},
+    )
+
+    (record,) = keep.records
+    assert record.plan == "_Plan.PRO"
+    assert record.contact.startswith("_Contact(full_name='[REDACTED]'")
+    assert leaked(record.contact, [contact.full_name, contact.email]) == []
+    assert record.rows == [{"email": "[REDACTED]"}]
 
 
 def test_exceptions_and_stacks(logger: logging.Logger, pii: dict[str, str]) -> None:
@@ -160,7 +307,11 @@ def test_failure_quarantines_the_record(logger: logging.Logger, pii: dict[str, s
     assert redacting.redactor.stats.snapshot() == {"QUARANTINED": 1}
 
 
-def test_install_on_every_handler(logger: logging.Logger, pii: dict[str, str]) -> None:
+def test_install_on_every_handler(pii: dict[str, str]) -> None:
+    # Not registered with logging.getLogger: pytest attaches its own handlers to those,
+    # and the filter would stay on them for the next tests.
+    logger = logging.Logger("caviard.tests.install", logging.DEBUG)
+    logger.propagate = False
     first, second = Keep(), Keep()
     logger.addHandler(first)
     logger.addHandler(second)
@@ -209,3 +360,23 @@ def test_structlog_processor(pii: dict[str, str]) -> None:
 def test_structlog_processor_quarantine(pii: dict[str, str]) -> None:
     process = structlog_processor(redactor=exploding_redactor())
     assert process(None, "info", {"event": pii["email"]}) == {"event": QUARANTINED}
+
+
+class _LibraryState:
+    """An object a library keeps on its records, under a private name."""
+
+
+def test_private_extra_fields_with_data_are_redacted(
+    logger: logging.Logger, keep: Keep, pii: dict[str, str]
+) -> None:
+    state = _LibraryState()
+    logger.info(
+        "commande",
+        extra={"_customer": pii["email"], "_rows": [{"tel": pii["phone"]}], "_state": state},
+    )
+
+    (record,) = keep.records
+    # OpenTelemetry's LoggingHandler and JSON formatters export private fields too.
+    assert record._customer.startswith("[EMAIL:")
+    assert leaked(str(record._rows), pii.values()) == []
+    assert record._state is state  # a library's own state is left alone

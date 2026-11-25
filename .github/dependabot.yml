@@ -5,6 +5,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7 # a release has a week to be found bad before it is proposed
     groups:
       actions:
         patterns: ["*"]

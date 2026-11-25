@@ -77,16 +77,20 @@ def decode_key(text: str) -> bytes:
             return base64.urlsafe_b64decode(candidate + "=" * (-len(candidate) % 4))
         except (binascii.Error, ValueError):
             pass
-    return candidate.encode("utf-8")
+    return candidate.encode("utf-8", "surrogateescape")  # undecodable bytes of an env var
 
 
 def resolve_key(env_name: str | None, key_file: str | None) -> SecretKey | None:
     """Load the key from a file (preferred) or from an environment variable."""
     if key_file:
         try:
-            text = Path(key_file).read_text(encoding="utf-8")
+            raw = Path(key_file).read_bytes()
         except OSError:
             raise PolicyError("cannot read the pseudonym key file") from None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:  # never raised further: the error would hold the key
+            return SecretKey(raw)  # raw random bytes, as written by `openssl rand 32`
         return SecretKey(decode_key(text))
     if env_name:
         text = os.environ.get(env_name, "")

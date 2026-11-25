@@ -34,7 +34,9 @@ dependencies = []
 [project.optional-dependencies]
 otel = ["opentelemetry-sdk>=1.27"]
 langfuse = ["langfuse>=5"]
-litellm = ["litellm>=1.60,!=1.82.7,!=1.82.8"]
+# LiteLLM 1.87.4 is the first version that logs async streams sequentially. 1.82.7,
+# 1.82.8 and 1.107.0 were compromised on PyPI (the first two are below the floor too).
+litellm = ["litellm>=1.87.4,!=1.82.7,!=1.82.8,!=1.107.0"]
 yaml = ["pyyaml>=6"]
 
 [project.urls]
@@ -53,13 +55,13 @@ test = [
   "pytest-timeout>=2.3",
   "hypothesis>=6.120",
   "faker>=30",
-  "opentelemetry-sdk>=1.27",
-  "opentelemetry-exporter-otlp-proto-common>=1.27",
+  "opentelemetry-sdk>=1.39",
+  "opentelemetry-exporter-otlp-proto-common>=1.39",
   "pyyaml>=6",
 ]
 integrations = [
   "langfuse>=5",
-  "litellm>=1.60,!=1.82.7,!=1.82.8",
+  "litellm>=1.87.4,!=1.82.7,!=1.82.8,!=1.107.0",
 ]
 lint = [
   "ruff>=0.9",

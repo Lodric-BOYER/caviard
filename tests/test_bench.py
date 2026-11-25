@@ -34,9 +34,26 @@ def test_bench_measures_recall_and_false_positives() -> None:
             assert row["changed_clean_inputs"] == 0
         else:
             assert row["recall"] == 1.0
+    entities = result["entities"]
+    assert sorted(entities) == [
+        "CARD",
+        "EMAIL",
+        "FR_NIR",
+        "FR_PHONE",
+        "FR_SIRET",
+        "IBAN",
+        "IP_ADDRESS",
+        "SECRET",
+    ]
+    assert all(
+        counts["recall"] == 1.0 and counts["identifiers"] > 0 for counts in entities.values()
+    )
+    per_scenario = sum(row["identifiers"] for row in result["scenarios"])
+    assert sum(counts["identifiers"] for counts in entities.values()) == per_scenario
     text = render_bench(result)
     assert "message with identifiers" in text
     assert "0 changed" in text
+    assert "FR_NIR" in text
 
 
 def test_bench_needs_inputs() -> None:

@@ -16,15 +16,36 @@ on:
 permissions:
   contents: read
 
+env:
+  UV_NO_PROGRESS: "1"
+  # Supply chain: the build tools (hatchling, twine) were published at least 7 days ago.
+  UV_EXCLUDE_NEWER: "7 days"
+
+# One release at a time; a running one is never cancelled halfway through publishing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  ci:
+    name: CI
+    # Same repository and commit. The classic ./ form rather than the newer $/ one,
+    # which some tools (actionlint 1.7) do not read yet.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+
   build:
     name: Build the distributions
+    needs: ci # the release runs the whole test suite on the tagged commit first
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          enable-cache: false # a release is built from a clean slate, never from a cache
       - name: Check that the tag matches the package version
         if: github.ref_type == 'tag'
         run: |
@@ -54,13 +75,14 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
 
   pypi:
     name: Publish to PyPI
-    if: github.ref_type == 'tag'
+    # A pushed tag only: a manual run started from a tag publishes to TestPyPI at most.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -73,4 +95,4 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

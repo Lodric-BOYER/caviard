@@ -22,7 +22,9 @@ from caviard.core import entities as E
 from caviard.core.policy import Action, EntityRule, Policy
 from caviard.core.redactor import Redactor
 
-__all__ = ["ENTITY_LABELS", "KIND_LABELS", "Auditor", "propose_policy"]
+__all__ = ["ENTITY_LABELS", "KIND_LABELS", "SCHEMA_VERSION", "Auditor", "propose_policy"]
+
+SCHEMA_VERSION = 1  # of the summary; raised when a field changes meaning or disappears
 
 ENTITY_LABELS: dict[str, str] = {
     E.SECRET: "Secret (API key, token, password)",
@@ -115,11 +117,13 @@ class Auditor:
     # Input
 
     def add_file(self, path: Path, fmt: str = "auto") -> FileStats:
-        stats = FileStats(path.name)
+        stats = FileStats(self._safe(path.name))  # error messages print it
         self.files.append(stats)
         for record in read(path, fmt, stats):
             self.add(record)
         self.skipped["unreadable"] += stats.unreadable
+        self.skipped["ignored"] += stats.ignored
+        self.skipped["too_large"] += stats.too_long
         return stats
 
     def add(self, record: Record) -> Counter[str]:
@@ -153,16 +157,21 @@ class Auditor:
             key=lambda item: (-sum(item[1].findings.values()), item[0]),
         )
         suggestions = {loc: _suggestion(stats) for loc, stats in ranked}
+        source = self._safe(self.policy_source) if self.policy_source else None
         summary: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION,
             "caviard_version": __version__,
             "generated_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "policy": {"preset": self.policy.preset, "file": self.policy_source},
+            "policy": {"preset": self.policy.preset, "file": source},
             "files": [
                 {
-                    "name": f.name,
+                    "name": self._safe(f.name),  # file names can hold personal data too
                     "format": f.format,
                     "records": f.records,
                     "unreadable": f.unreadable,
+                    "ignored": f.ignored,
+                    "invalid_json": f.invalid_json,
+                    "too_long": f.too_long,
                 }
                 for f in self.files
             ],
@@ -202,7 +211,8 @@ class Auditor:
             "services": _groups(self.services),
             "scopes": _groups(self.scopes),
             "skipped": {
-                name: self.skipped[name] for name in ("too_large", "binary", "errors", "unreadable")
+                name: self.skipped[name]
+                for name in ("too_large", "binary", "errors", "unreadable", "ignored")
             },
             "warnings": self._warnings(ranked, suggestions),
         }
@@ -356,10 +366,19 @@ class Auditor:
             "errors": "value(s) could not be analysed (detector error): "
             "they are quarantined at export",
             "unreadable": "line(s) were not valid JSON: they were analysed as text",
+            "ignored": "JSON value(s) are not OTLP requests: they were not analysed "
+            "(use --format auto or jsonl)",
         }
         for name, message in messages.items():
             if self.skipped[name]:
                 warn(name, f"{self.skipped[name]} {message}.")
+        for file in self.files:
+            if file.invalid_json:
+                warn(
+                    "invalid_json",
+                    f"'{self._safe(file.name)}' is not valid JSON: it was analysed as text "
+                    "lines, so field names did not apply.",
+                )
         if any(loc.key == _OTHER_KEYS for loc, _ in ranked):
             warn(
                 "many_locations",
@@ -381,9 +400,17 @@ def propose_policy(
         "version = 1",
         f"preset = {_toml(preset)}",
     ]
-    mask, hash_ = sorted(set(mask)), sorted(set(hash_))
-    if not mask and not hash_:
+    wanted = set(mask) | set(hash_)
+    mask = sorted(p for p in set(mask) if _representable(p))
+    hash_ = sorted(p for p in set(hash_) - set(mask) if _representable(p))  # mask wins
+    left_out = len(wanted) - len(mask) - len(hash_)
+    if left_out:
+        lines.append(
+            f"# {left_out} key(s) hold invalid Unicode and cannot be written here: rename them."
+        )
+    elif not mask and not hash_:
         lines.append("# No key rule needed: the detectors cover every finding of this sample.")
+    if not mask and not hash_:
         return "\n".join(lines) + "\n"
     lines += ["", "[keys]"]
     if mask:
@@ -456,4 +483,10 @@ def _groups(groups: dict[str, GroupStats]) -> list[dict[str, Any]]:
 
 
 def _toml(text: str) -> str:
-    return json.dumps(text, ensure_ascii=False)  # JSON strings are valid TOML basic strings
+    # A JSON string is a TOML basic string, once DEL (which JSON leaves as is) is escaped.
+    return json.dumps(text, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def _representable(text: str) -> bool:
+    """False for text holding lone surrogates (from JSON escapes): TOML cannot hold them."""
+    return not any("\ud800" <= char <= "\udfff" for char in text)

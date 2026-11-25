@@ -52,12 +52,14 @@ def test_otlp_traces_as_json_lines(tmp_path: Path) -> None:
         ("span", "span.name"),
         ("span", "gen_ai.prompt"),
         ("span", "gen_ai.usage.input_tokens"),
+        ("event", "event.name"),
         ("event", "exception.message"),
         ("link", "handoff.note"),
         ("status", "status.message"),
     ]
     assert span.fields[2].value == 12  # int64 decoded from its JSON string
-    assert span.fields[3].detail == "exception"
+    assert span.fields[3].value == "exception"  # event names are analysed too
+    assert span.fields[4].detail == "exception"
     assert not span.fields[0].attribute  # span names cannot be targeted by key rules
 
 
@@ -75,6 +77,7 @@ def test_otlp_logs_and_legacy_names(tmp_path: Path) -> None:
     request = otlp.logs(
         [("Connexion de l'utilisateur", {"user.role": "admin"})], resource={"service.name": "api"}
     )
+    request["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["eventName"] = "user.login"
     path = otlp.write_jsonl(tmp_path / "mixed.jsonl", [legacy, request])
 
     records, _ = _records(path)
@@ -83,7 +86,7 @@ def test_otlp_logs_and_legacy_names(tmp_path: Path) -> None:
     assert kinds == ["span", "resource", "log"]
     assert records[0].scope == "old"
     assert records[2].service == "api"
-    assert _keys(records[2]) == [("log", "body"), ("log", "user.role")]
+    assert _keys(records[2]) == [("log", "body"), ("log", "event.name"), ("log", "user.role")]
 
 
 def test_otlp_value_types() -> None:
@@ -164,7 +167,15 @@ def test_forced_formats(tmp_path: Path) -> None:
     )
     records, stats = _records(lines, "otlp")
     assert [record.kind for record in records] == ["span"]
-    assert stats.unreadable == 1
+    assert (stats.ignored, stats.unreadable) == (1, 0)
+    # Forced on a file without any OTLP request, the format would make it look clean.
+    other = otlp.write_jsonl(tmp_path / "app.jsonl", [{"event": "a"}, {"event": "b"}])
+    with pytest.raises(CaviardError, match="holds no OTLP request"):
+        _records(other, "otlp")
+    document = tmp_path / "app.json"
+    document.write_text(json.dumps([{"event": "a"}], indent=2), encoding="utf-8")
+    with pytest.raises(CaviardError, match="holds no OTLP request"):
+        _records(document, "otlp")
 
     records, stats = _records(lines, "text")
     assert stats.format == "text"
@@ -178,7 +189,8 @@ def test_forced_formats(tmp_path: Path) -> None:
     broken.write_text("{\n  oops\n", encoding="utf-8")
     with pytest.raises(CaviardError, match="not valid JSON"):
         _records(broken, "otlp")
-    assert _records(broken)[1].format == "text"  # auto falls back to text
+    fallback = _records(broken)[1]  # auto falls back to text, and says so
+    assert (fallback.format, fallback.invalid_json) == ("text", True)
 
 
 def test_empty_and_unreadable_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,5 +210,33 @@ def test_empty_and_unreadable_files(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     big = tmp_path / "big.json"
     big.write_text("{\n" + '"a": 1,\n' * 50 + '"b": 2\n}\n', encoding="utf-8")
     monkeypatch.setattr(readers, "_MAX_DOCUMENT", 20)
-    with pytest.raises(CaviardError, match="too large"):
+    with pytest.raises(CaviardError, match="too large to read at once"):
         _records(big)
+
+
+def test_lines_longer_than_the_cap_are_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(readers, "_MAX_LINE", 50)
+    monkeypatch.setattr(readers, "_MAX_DOCUMENT", 120)
+    text = tmp_path / "app.log"
+    text.write_text("début\n" + "x" * 500 + "\nfin\n", encoding="utf-8")
+    records, stats = _records(text)
+    assert [r.fields[0].value for r in records] == ["début", "fin"]
+    assert (stats.format, stats.too_long) == ("text", 1)
+
+    lines = tmp_path / "logs.jsonl"
+    lines.write_text('{"a": 1}\n{"b": "' + "y" * 500 + '"}\n{"c": 3}\n', encoding="utf-8")
+    records, stats = _records(lines)
+    assert [r.fields[0].key for r in records] == ["a", "c"]
+    assert (stats.format, stats.too_long) == ("jsonl", 1)
+
+    minified = tmp_path / "export.json"
+    minified.write_text('[{"a": "' + "z" * 500 + '"}]', encoding="utf-8")
+    with pytest.raises(CaviardError, match="too large to read at once"):
+        _records(minified)
+    one_line = tmp_path / "one.log"
+    one_line.write_text("w" * 500 + "\nfin\n", encoding="utf-8")
+    records, stats = _records(one_line)
+    assert [r.fields[0].value for r in records] == ["fin"]
+    assert stats.too_long == 1

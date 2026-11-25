@@ -13,6 +13,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 from caviard import OnError, Policy
 from caviard.integrations.langfuse import QUARANTINE_FLAG, QUARANTINED, mask_otel_spans
+from caviard.otel import RedactingSpanExporter
 from helpers import TEST_KEY, exploding_redactor, leaked, make_redactor
 
 pytestmark = pytest.mark.integration
@@ -71,6 +72,20 @@ def test_hook_redacts_and_keeps_langfuse_values_valid_json(pii: dict[str, str]) 
     assert "gen_ai.usage.input_tokens" not in patch.set_attributes
     assert patch.set_attributes["user.email"] == "[REDACTED]"
     assert json.loads(patch.set_attributes["langfuse.observation.metadata.email"]) == "[REDACTED]"
+
+
+@pytest.mark.parametrize("make", [make_redactor, exploding_redactor], ids=["redacts", "fails"])
+def test_json_too_deep_to_parse_never_drops_the_batch(make: Any) -> None:
+    # A user input nested deeper than the interpreter can parse (10,000 levels already
+    # breaks Python 3.13): the hook must still answer, or Langfuse drops the whole batch.
+    deep = "[" * 100_000 + "]" * 100_000
+    hook = mask_otel_spans(redactor=make())
+    (patch,) = _patches(hook(params=_params({"langfuse.observation.input": deep})))
+    value = patch.set_attributes["langfuse.observation.input"]
+    decoded = json.loads(value)  # still valid JSON for Langfuse
+    # Replaced whole, or walked down to 64 levels where the parser goes that deep.
+    assert decoded == QUARANTINED or "[REDACTED]" in value
+    assert len(value) < 1_000
 
 
 def test_clean_span_gets_no_patch() -> None:
@@ -156,3 +171,28 @@ def test_end_to_end_with_the_langfuse_sdk(pii: dict[str, str]) -> None:
     attributes = spans[0].attributes or {}
     assert attributes["langfuse.observation.model.name"] == "gpt-4o-mini"
     assert "[FR_NIR]" in str(attributes["langfuse.observation.input"])
+
+
+def test_wrapped_exporter_also_covers_span_names(pii: dict[str, str]) -> None:
+    # The README alternative to the hook: Langfuse exports through RedactingSpanExporter.
+    langfuse = pytest.importorskip("langfuse")
+    memory = InMemorySpanExporter()
+    client = langfuse.Langfuse(
+        public_key=f"pk-lf-test-{uuid.uuid4().hex}",
+        secret_key="sk-lf-test",  # never used: spans go to the in-memory exporter
+        base_url="http://127.0.0.1:9",
+        span_exporter=RedactingSpanExporter(memory, redactor=make_redactor()),
+    )
+    try:
+        with client.start_as_current_observation(
+            name=f"lookup {pii['email']}", as_type="span", input={"iban": pii["iban"]}
+        ) as span:
+            span.update(output=f"Je vous rappelle au {pii['phone']}")
+        client.flush()
+    finally:
+        client.shutdown()
+
+    spans = memory.get_finished_spans()
+    assert spans, "the Langfuse SDK exported nothing"
+    assert leaked(encode_spans(spans).SerializeToString(), pii.values()) == []
+    assert spans[0].name.startswith("lookup [EMAIL:")
